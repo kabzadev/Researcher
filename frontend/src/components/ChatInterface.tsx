@@ -68,20 +68,47 @@ export function ChatInterface() {
 
       const data = await response.json()
 
-      // Transform API response to Message format
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
-        thinking: [
-          ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
-          ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
-          ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
-        ],
-        drivers: {
-          macro: data.summary?.macro_drivers || [],
-          brand: data.summary?.brand_drivers || [],
-          competitive: data.summary?.competitive_drivers || []
+      // Check if any findings were returned
+      const hasFindings = 
+        (data.summary?.macro_drivers?.length || 0) > 0 ||
+        (data.summary?.brand_drivers?.length || 0) > 0 ||
+        (data.summary?.competitive_drivers?.length || 0) > 0
+
+      let assistantMessage: Message
+
+      if (!hasFindings) {
+        // No findings returned
+        assistantMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
+          thinking: [
+            ...(data.validated_hypotheses?.market || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
+            ...(data.validated_hypotheses?.brand || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
+            ...(data.validated_hypotheses?.competitive || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`)
+          ],
+          drivers: {
+            macro: [],
+            brand: [],
+            competitive: []
+          }
+        }
+      } else {
+        // Has findings - normal response
+        assistantMessage = {
+          id: (Date.now() + 1).toString(),
+          role: 'assistant',
+          content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
+          thinking: [
+            ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
+            ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
+            ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
+          ],
+          drivers: {
+            macro: data.summary?.macro_drivers || [],
+            brand: data.summary?.brand_drivers || [],
+            competitive: data.summary?.competitive_drivers || []
+          }
         }
       }
 

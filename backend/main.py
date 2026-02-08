@@ -44,10 +44,11 @@ class ResearchRequest(BaseModel):
 class ResearchResponse(BaseModel):
     question: str
     brand: str
+    metrics: List[str]  # Frontend expects array
     direction: str
     time_period: Optional[str]
     hypotheses: Dict[str, List[Dict]]
-    validated_findings: Dict[str, List[Dict]]
+    validated_hypotheses: Dict[str, List[Dict]]  # Changed from validated_findings
     summary: Dict[str, List[Dict]]
 
 # Competitor Database
@@ -81,13 +82,23 @@ def research(req: ResearchRequest):
         # Step 5: Build summary
         summary = build_summary(validated)
         
+        # Handle metric - ensure it's an array for frontend
+        metric_val = parsed.get("metric", "salient")
+        if isinstance(metric_val, str):
+            metrics_arr = [metric_val]
+        elif isinstance(metric_val, list):
+            metrics_arr = metric_val
+        else:
+            metrics_arr = ["salient"]
+        
         return ResearchResponse(
             question=req.question,
             brand=parsed["brand"],
+            metrics=metrics_arr,
             direction=parsed["direction"],
             time_period=parsed.get("time_period"),
             hypotheses=hypotheses,
-            validated_findings=validated,
+            validated_hypotheses=validated,
             summary=summary
         )
     except anthropic.BadRequestError as e:
