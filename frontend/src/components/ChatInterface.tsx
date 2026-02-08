@@ -94,7 +94,14 @@ export function ChatInterface() {
           }
         }
       } else {
-        // Has findings - normal response
+        // Has findings - normal response - transform backend fields to frontend Driver interface
+        const transformDriver = (d: any): Driver => ({
+          hypothesis: d.hypothesis || '',
+          evidence: d.driver || d.evidence || '',
+          url: d.source_urls?.[0] || d.url || '',
+          source: d.source_title || (d.source_urls?.[0] ? new URL(d.source_urls[0]).hostname.replace('www.', '') : 'Source')
+        })
+
         assistantMessage = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
@@ -105,9 +112,9 @@ export function ChatInterface() {
             ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
           ],
           drivers: {
-            macro: data.summary?.macro_drivers || [],
-            brand: data.summary?.brand_drivers || [],
-            competitive: data.summary?.competitive_drivers || []
+            macro: (data.summary?.macro_drivers || []).map(transformDriver),
+            brand: (data.summary?.brand_drivers || []).map(transformDriver),
+            competitive: (data.summary?.competitive_drivers || []).map(transformDriver)
           }
         }
       }
