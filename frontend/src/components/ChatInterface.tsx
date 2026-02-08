@@ -58,7 +58,19 @@ export function ChatInterface() {
     setIsLoading(true)
 
     try {
-      const response = await fetch(`${API_URL}/research`, {
+      // Create a placeholder assistant message we will update as SSE events arrive
+      const assistantId = (Date.now() + 1).toString()
+      setMessages(prev => [
+        ...prev,
+        {
+          id: assistantId,
+          role: 'assistant',
+          content: 'Researching…',
+          provider
+        }
+      ])
+
+      const response = await fetch(`${API_URL}/research/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ question: input, provider })
@@ -68,69 +80,114 @@ export function ChatInterface() {
         throw new Error(`API error: ${response.status}`)
       }
 
-      const data = await response.json()
+      if (!response.body) {
+        throw new Error('Streaming not supported by browser')
+      }
 
-      // Check if any findings were returned
-      const hasFindings = 
-        (data.summary?.macro_drivers?.length || 0) > 0 ||
-        (data.summary?.brand_drivers?.length || 0) > 0 ||
-        (data.summary?.competitive_drivers?.length || 0) > 0
+      const decoder = new TextDecoder()
+      const reader = response.body.getReader()
+      let buffer = ''
 
-      let assistantMessage: Message
-
-      if (!hasFindings) {
-        // No findings returned
-        assistantMessage = {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
-          content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
-          thinking: [
-            ...(data.validated_hypotheses?.market || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
-            ...(data.validated_hypotheses?.brand || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
-            ...(data.validated_hypotheses?.competitive || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`)
-          ],
-          drivers: {
-            macro: [],
-            brand: [],
-            competitive: []
-          }
-        }
-      } else {
-        // Has findings - normal response - transform backend fields to frontend Driver interface
-        const extractHostname = (url: string): string => {
-          try {
-            return new URL(url).hostname.replace('www.', '')
-          } catch {
-            return 'Source'
-          }
-        }
-        
-        const transformDriver = (d: any): Driver => ({
-          hypothesis: d.hypothesis || '',
-          evidence: d.driver || d.evidence || '',
-          url: d.source_urls?.[0] || d.source || d.url || '',
-          source: d.source_title || (d.source_urls?.[0] ? extractHostname(d.source_urls[0]) : d.source ? extractHostname(d.source) : 'Source')
-        })
-
-        assistantMessage = {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
-          content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
-          provider: data.provider_used || provider,
-          thinking: [
-            ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
-            ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
-            ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
-          ],
-          drivers: {
-            macro: (data.summary?.macro_drivers || []).map(transformDriver),
-            brand: (data.summary?.brand_drivers || []).map(transformDriver),
-            competitive: (data.summary?.competitive_drivers || []).map(transformDriver)
-          }
+      const extractHostname = (url: string): string => {
+        try {
+          return new URL(url).hostname.replace('www.', '')
+        } catch {
+          return 'Source'
         }
       }
 
-      setMessages(prev => [...prev, assistantMessage])
+      const transformDriver = (d: any): Driver => ({
+        hypothesis: d.hypothesis || '',
+        evidence: d.driver || d.evidence || '',
+        url: d.source_urls?.[0] || d.source || d.url || '',
+        source: d.source_title || (d.source_urls?.[0] ? extractHostname(d.source_urls[0]) : d.source ? extractHostname(d.source) : 'Source')
+      })
+
+      const updateAssistant = (patch: Partial<Message>) => {
+        setMessages(prev => prev.map(m => (m.id === assistantId ? { ...m, ...patch } : m)))
+      }
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop() || ''
+
+        for (const part of parts) {
+          const lines = part.split('\n').filter(Boolean)
+          const eventLine = lines.find(l => l.startsWith('event:'))
+          const dataLine = lines.find(l => l.startsWith('data:'))
+          if (!eventLine || !dataLine) continue
+
+          const event = eventLine.replace('event:', '').trim()
+          const raw = dataLine.replace('data:', '').trim()
+
+          let data: any
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            continue
+          }
+
+          if (event === 'status') {
+            if (data.stage === 'search') {
+              updateAssistant({ content: `Researching… (0/${data.total_hypotheses || 0})` })
+            }
+          }
+
+          if (event === 'hypothesis_result') {
+            const completed = data.completed || 0
+            const total = data.total || 0
+            updateAssistant({ content: `Researching… (${completed}/${total})` })
+          }
+
+          if (event === 'final') {
+            const hasFindings =
+              (data.summary?.macro_drivers?.length || 0) > 0 ||
+              (data.summary?.brand_drivers?.length || 0) > 0 ||
+              (data.summary?.competitive_drivers?.length || 0) > 0
+
+            let assistantMessage: Message
+
+            if (!hasFindings) {
+              assistantMessage = {
+                id: assistantId,
+                role: 'assistant',
+                content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
+                provider: data.provider_used || provider,
+                thinking: [
+                  ...(data.validated_hypotheses?.market || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
+                  ...(data.validated_hypotheses?.brand || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
+                  ...(data.validated_hypotheses?.competitive || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`)
+                ],
+                drivers: { macro: [], brand: [], competitive: [] }
+              }
+            } else {
+              assistantMessage = {
+                id: assistantId,
+                role: 'assistant',
+                content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
+                provider: data.provider_used || provider,
+                thinking: [
+                  ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
+                  ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
+                  ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
+                ],
+                drivers: {
+                  macro: (data.summary?.macro_drivers || []).map(transformDriver),
+                  brand: (data.summary?.brand_drivers || []).map(transformDriver),
+                  competitive: (data.summary?.competitive_drivers || []).map(transformDriver)
+                }
+              }
+            }
+
+            // Replace placeholder with final structured message
+            setMessages(prev => prev.map(m => (m.id === assistantId ? assistantMessage : m)))
+          }
+        }
+      }
     } catch (error: any) {
       let errorMsg = "Sorry, there was an error processing your request."
       
@@ -241,32 +298,37 @@ export function ChatInterface() {
 
       {/* Provider Toggle */}
       <div className="px-4 py-2 bg-slate-50 border-t border-slate-200">
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-slate-500">LLM Provider:</span>
-          <div className="flex gap-2">
-            <button
-              onClick={() => setProvider('anthropic')}
-              disabled={isLoading}
-              className={`px-3 py-1 text-xs rounded-full transition-colors ${
-                provider === 'anthropic'
-                  ? 'bg-violet-600 text-white'
-                  : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
-              } disabled:opacity-50`}
-            >
-              Anthropic
-            </button>
-            <button
-              onClick={() => setProvider('openai')}
-              disabled={isLoading}
-              className={`px-3 py-1 text-xs rounded-full transition-colors ${
-                provider === 'openai'
-                  ? 'bg-emerald-600 text-white'
-                  : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
-              } disabled:opacity-50`}
-            >
-              OpenAI
-            </button>
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-slate-500">LLM Provider:</span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setProvider('anthropic')}
+                disabled={isLoading}
+                className={`px-3 py-1 text-xs rounded-full transition-colors ${
+                  provider === 'anthropic'
+                    ? 'bg-violet-600 text-white'
+                    : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
+                } disabled:opacity-50`}
+              >
+                Anthropic
+              </button>
+              <button
+                onClick={() => setProvider('openai')}
+                disabled={isLoading}
+                className={`px-3 py-1 text-xs rounded-full transition-colors ${
+                  provider === 'openai'
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
+                } disabled:opacity-50`}
+              >
+                OpenAI
+              </button>
+            </div>
           </div>
+          <p className="text-[10px] text-slate-400">
+            All API keys stored in Azure Key Vault • No inline secrets
+          </p>
         </div>
       </div>
 

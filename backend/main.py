@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import anthropic
 from openai import OpenAI
@@ -44,16 +45,18 @@ def get_anthropic_client():
     global anthropic_client
     if anthropic_client is None:
         api_key = os.getenv("ANTHROPIC_API_KEY")
-        if api_key:
-            anthropic_client = anthropic.Anthropic(api_key=api_key)
+        if not api_key:
+            raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+        anthropic_client = anthropic.Anthropic(api_key=api_key)
     return anthropic_client
 
 def get_openai_client():
     global openai_client
     if openai_client is None:
         api_key = os.getenv("OPENAI_API_KEY")
-        if api_key:
-            openai_client = OpenAI(api_key=api_key)
+        if not api_key:
+            raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
+        openai_client = OpenAI(api_key=api_key)
     return openai_client
 
 def get_tavily_client():
@@ -199,6 +202,135 @@ def research(req: ResearchRequest):
         raise HTTPException(status_code=400, detail=f"OpenAI model error: {error_msg}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Research error: {str(e)}")
+
+@app.post("/research/stream")
+def research_stream(req: ResearchRequest):
+    """Streaming research endpoint (SSE).
+
+    Emits incremental events so the UI can render results as they arrive.
+    """
+
+    provider = req.provider or DEFAULT_PROVIDER
+
+    def sse(event: str, data: Any):
+        payload = json.dumps(data, ensure_ascii=False)
+        return f"event: {event}\ndata: {payload}\n\n"
+
+    def event_gen():
+        started_at = datetime.now()
+        yield sse("status", {"stage": "start", "provider": provider})
+
+        # Step 1: Parse question
+        parsed = parse_question(req.question, provider=provider)
+        yield sse("parsed", parsed)
+
+        # Step 2: Get competitors
+        competitors = COMPETITOR_DB.get(parsed.get("brand", ""), [])
+        yield sse("competitors", {"competitors": competitors})
+
+        # Step 3: Generate hypotheses
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider)
+        yield sse("hypotheses", hypotheses)
+
+        # Step 4: Process hypotheses in parallel and stream results
+        tavily = get_tavily_client()
+        tasks: List[tuple[Dict, str]] = []
+        for cat in ["market", "brand", "competitive"]:
+            for hyp in hypotheses.get(cat, []) or []:
+                tasks.append((hyp, cat))
+
+        validated = {"market": [], "brand": [], "competitive": []}
+        yield sse("status", {"stage": "search", "total_hypotheses": len(tasks)})
+
+        def process_one(hyp: Dict, cat: str) -> Dict:
+            query = hyp.get("search_query") or hyp.get("hypothesis") or ""
+            if not query:
+                return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
+
+            search_result = tavily.search(
+                query=query,
+                search_depth="basic",
+                max_results=3,
+                include_raw_content=True,
+            )
+            results = search_result.get("results", []) or []
+            validation = {"validated": False, "evidence": ""}
+            if results:
+                validation = validate_hypothesis(hyp, results, provider=provider)
+
+            return {
+                "category": cat,
+                "hypothesis": hyp.get("hypothesis"),
+                "search_query": query,
+                "validated": bool(validation.get("validated")),
+                "confidence": hyp.get("confidence"),
+                "evidence": validation.get("evidence", ""),
+                "source": (results[0].get("url") if results else None),
+                "source_title": (results[0].get("title") if results else None),
+                "result_count": len(results),
+            }
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_task = {executor.submit(process_one, hyp, cat): (hyp, cat) for hyp, cat in tasks}
+            completed = 0
+            for future in as_completed(future_to_task):
+                completed += 1
+                hyp, cat = future_to_task[future]
+                try:
+                    item = future.result()
+                except Exception as e:
+                    item = {
+                        "category": cat,
+                        "hypothesis": hyp.get("hypothesis"),
+                        "validated": False,
+                        "error": str(e),
+                    }
+                if item.get("validated"):
+                    validated[cat].append(
+                        {
+                            "status": "VALIDATED",
+                            "hypothesis": item.get("hypothesis"),
+                            "evidence": item.get("evidence"),
+                            "source": item.get("source"),
+                            "source_title": item.get("source_title"),
+                        }
+                    )
+
+                yield sse(
+                    "hypothesis_result",
+                    {
+                        **item,
+                        "completed": completed,
+                        "total": len(tasks),
+                    },
+                )
+
+        # Step 5: Build summary + final response
+        summary = build_summary(validated)
+
+        metric_val = parsed.get("metric", "salient")
+        if isinstance(metric_val, str):
+            metrics_arr = [metric_val]
+        elif isinstance(metric_val, list):
+            metrics_arr = metric_val
+        else:
+            metrics_arr = ["salient"]
+
+        resp = {
+            "question": req.question,
+            "brand": parsed.get("brand"),
+            "metrics": metrics_arr,
+            "direction": parsed.get("direction"),
+            "time_period": parsed.get("time_period"),
+            "provider_used": provider,
+            "hypotheses": hypotheses,
+            "validated_hypotheses": validated,
+            "summary": summary,
+            "latency_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+        }
+        yield sse("final", resp)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 def parse_question(question: str, provider: Optional[str] = None) -> Dict:
     """Extract brand, metric, direction from question using LLM"""
