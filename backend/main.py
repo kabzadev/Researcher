@@ -60,9 +60,17 @@ def get_tavily_client():
     global tavily_client
     if tavily_client is None:
         api_key = os.getenv("TAVILY_API_KEY")
-        if api_key:
-            tavily_client = TavilyClient(api_key=api_key)
+        if not api_key:
+            raise HTTPException(status_code=503, detail="TAVILY_API_KEY not configured")
+        tavily_client = TavilyClient(api_key=api_key)
     return tavily_client
+
+# Eagerly initialize Tavily at startup to catch config errors early
+try:
+    get_tavily_client()
+    print("✓ Tavily client initialized")
+except Exception as e:
+    print(f"⚠ Tavily initialization failed: {e}")
 
 # LLM Configuration
 DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "anthropic")
