@@ -11,11 +11,11 @@ export function Layout({ children, sidebarOpen, onToggleSidebar }: LayoutProps) 
     <div className="flex h-screen bg-slate-50">
       {/* Left Sidebar */}
       <aside
-        className={`bg-white border-r border-slate-200 transition-all duration-300 ${
+        className={`bg-white border-r border-slate-200 transition-all duration-300 flex flex-col ${
           sidebarOpen ? 'w-64' : 'w-0 overflow-hidden'
         }`}
       >
-        <div className="p-4 border-b border-slate-200">
+        <div className="p-4 border-b border-slate-200 flex-shrink-0">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 bg-primary rounded-lg flex items-center justify-center">
               <Search className="w-5 h-5 text-white" />
@@ -24,13 +24,13 @@ export function Layout({ children, sidebarOpen, onToggleSidebar }: LayoutProps) 
           </div>
         </div>
 
-        <nav className="p-2">
+        <nav className="p-2 flex-1 overflow-y-auto">
           <NavItem icon={<MessageSquare className="w-4 h-4" />} label="New Research" active />
           <NavItem icon={<FileText className="w-4 h-4" />} label="History" />
           <NavItem icon={<Settings className="w-4 h-4" />} label="Settings" />
         </nav>
 
-        <div className="absolute bottom-0 w-full p-4 border-t border-slate-200 bg-white">
+        <div className="p-4 border-t border-slate-200 bg-white flex-shrink-0">
           <div className="text-xs text-slate-500">
             <p className="font-medium">Researcher v0.1</p>
             <p>Hypothesis-driven research</p>
