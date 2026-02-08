@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import anthropic
+import openai
 from openai import OpenAI
 from tavily import TavilyClient
 
@@ -175,9 +176,9 @@ def research(req: ResearchRequest):
         
         return ResearchResponse(
             question=req.question,
-            brand=parsed["brand"],
+            brand=parsed.get("brand") or "unknown",
             metrics=metrics_arr,
-            direction=parsed["direction"],
+            direction=parsed.get("direction") or "change",
             time_period=parsed.get("time_period"),
             provider_used=provider,
             hypotheses=hypotheses,
