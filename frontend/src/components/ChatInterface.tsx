@@ -5,6 +5,7 @@ interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  provider?: string
   drivers?: {
     macro: Driver[]
     brand: Driver[]
@@ -30,6 +31,7 @@ export function ChatInterface() {
   ])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -59,7 +61,7 @@ export function ChatInterface() {
       const response = await fetch(`${API_URL}/research`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: input })
+        body: JSON.stringify({ question: input, provider })
       })
 
       if (!response.ok) {
@@ -114,6 +116,7 @@ export function ChatInterface() {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
           content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
+          provider: data.provider_used || provider,
           thinking: [
             ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
             ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
@@ -165,6 +168,18 @@ export function ChatInterface() {
                   : 'bg-white border border-slate-200 shadow-sm'
               }`}
             >
+              {/* Provider badge for assistant messages */}
+              {message.role === 'assistant' && message.provider && (
+                <div className="mb-2">
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${
+                    message.provider === 'anthropic' 
+                      ? 'bg-violet-100 text-violet-700' 
+                      : 'bg-emerald-100 text-emerald-700'
+                  }`}>
+                    {message.provider === 'anthropic' ? '🤖 Claude' : '⚡ GPT'}
+                  </span>
+                </div>
+              )}
               <div className="whitespace-pre-wrap">{message.content}</div>
 
               {/* Research Results */}
@@ -222,6 +237,37 @@ export function ChatInterface() {
         )}
 
         <div ref={messagesEndRef} />
+      </div>
+
+      {/* Provider Toggle */}
+      <div className="px-4 py-2 bg-slate-50 border-t border-slate-200">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-slate-500">LLM Provider:</span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setProvider('anthropic')}
+              disabled={isLoading}
+              className={`px-3 py-1 text-xs rounded-full transition-colors ${
+                provider === 'anthropic'
+                  ? 'bg-violet-600 text-white'
+                  : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
+              } disabled:opacity-50`}
+            >
+              Anthropic
+            </button>
+            <button
+              onClick={() => setProvider('openai')}
+              disabled={isLoading}
+              className={`px-3 py-1 text-xs rounded-full transition-colors ${
+                provider === 'openai'
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
+              } disabled:opacity-50`}
+            >
+              OpenAI
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Input */}
