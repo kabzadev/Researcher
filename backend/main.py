@@ -142,6 +142,36 @@ def parse_question(question: str) -> Dict:
     
     return {"brand": "unknown", "metric": "salient", "direction": "change", "time_period": None}
 
+def extract_json(text: str) -> Dict:
+    """Robust JSON extraction from Claude response"""
+    # Try to find JSON in code blocks first
+    code_match = re.search(r'```(?:json)?\s*\n?(\{.*?\})\n?\s*```', text, re.DOTALL)
+    if code_match:
+        try:
+            return json.loads(code_match.group(1))
+        except:
+            pass
+    
+    # Try to find JSON with balanced braces
+    try:
+        # Find the first { and match braces
+        start = text.find('{')
+        if start == -1:
+            return {}
+        
+        count = 0
+        for i, char in enumerate(text[start:]):
+            if char == '{':
+                count += 1
+            elif char == '}':
+                count -= 1
+                if count == 0:
+                    return json.loads(text[start:start+i+1])
+    except:
+        pass
+    
+    return {}
+
 def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[Dict]]:
     """Generate hypotheses for market, brand, and competitive factors"""
     
@@ -151,78 +181,94 @@ def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[
     
     hypotheses = {"market": [], "brand": [], "competitive": []}
     
-    # Market hypotheses
+    # Market hypotheses - use static fallback if Claude fails
     market_prompt = f"""Generate 3-4 hypotheses about UK fashion retail MARKET trends 
     that could cause {direction} in brand salience for {brand}.
     
-    Time: {time_period}
+    Time period: {time_period}
     
-    Return JSON: {{"hypotheses": [
-        {{"id": "M1", "hypothesis": "short description", "search_query": "UK fashion [topic] {time_period}"}}
-    ]}}"""
-    
-    response = anthropic_client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": market_prompt}]
-    )
+    Return ONLY a JSON object like:
+    {{"hypotheses": [{{"id": "M1", "hypothesis": "description", "search_query": "UK fashion trend Q3 2025"}}]}}"""
     
     try:
+        response = anthropic_client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": market_prompt}]
+        )
         content = response.content[0].text
-        json_match = re.search(r'\{.*?\}', content, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-            hypotheses["market"] = data.get("hypotheses", [])
-    except:
-        pass
+        data = extract_json(content)
+        hypotheses["market"] = data.get("hypotheses", [])
+    except Exception as e:
+        print(f"Market hypothesis error: {e}")
+    
+    # Fallback market hypotheses
+    if not hypotheses["market"]:
+        hypotheses["market"] = [
+            {"id": "M1", "hypothesis": f"Economic downturn affecting fashion spending in {time_period}", "search_query": f"UK fashion spending economy {time_period}"},
+            {"id": "M2", "hypothesis": "Online shopping shift away from physical retail", "search_query": f"UK online fashion shopping growth {time_period}"},
+            {"id": "M3", "hypothesis": "Seasonal trends or weather impacting fashion sales", "search_query": f"UK fashion sales weather seasonal {time_period}"}
+        ]
     
     # Brand hypotheses
-    brand_prompt = f"""Generate 3-4 hypotheses about {brand}'s actions 
+    brand_prompt = f"""Generate 3-4 hypotheses about {brand}'s specific actions or issues 
     that could cause brand salience to {direction}.
-    Areas: advertising spend, store activity, campaigns, media presence, PR.
+    Areas: advertising spend, store activity, marketing campaigns, PR, news coverage.
     
-    Return JSON: {{"hypotheses": [
-        {{"id": "B1", "hypothesis": "short description", "search_query": "{brand} [action] {time_period}"}}
-    ]}}"""
+    Time period: {time_period}
     
-    response = anthropic_client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": brand_prompt}]
-    )
+    Return ONLY a JSON object like:
+    {{"hypotheses": [{{"id": "B1", "hypothesis": "description", "search_query": "{brand} store closures 2025"}}]}}"""
     
     try:
+        response = anthropic_client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": brand_prompt}]
+        )
         content = response.content[0].text
-        json_match = re.search(r'\{.*?\}', content, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-            hypotheses["brand"] = data.get("hypotheses", [])
-    except:
-        pass
+        data = extract_json(content)
+        hypotheses["brand"] = data.get("hypotheses", [])
+    except Exception as e:
+        print(f"Brand hypothesis error: {e}")
+    
+    # Fallback brand hypotheses
+    if not hypotheses["brand"]:
+        hypotheses["brand"] = [
+            {"id": "B1", "hypothesis": f"{brand} store closures or reduced presence", "search_query": f"{brand} store closures {time_period}"},
+            {"id": "B2", "hypothesis": f"{brand} marketing or advertising spend changes", "search_query": f"{brand} advertising marketing {time_period}"},
+            {"id": "B3", "hypothesis": f"News or media coverage about {brand}", "search_query": f"{brand} news media {time_period}"}
+        ]
     
     # Competitive hypotheses
+    comp_list = ', '.join(competitors[:6]) if competitors else "main competitors"
     comp_prompt = f"""Generate 3-4 hypotheses about competitor actions affecting {brand}'s salience.
-    Competitors: {', '.join(competitors[:6])}
-    Time: {time_period}
+    Competitors to consider: {comp_list}
+    Time period: {time_period}
     
-    Return JSON: {{"hypotheses": [
-        {{"id": "C1", "hypothesis": "[Competitor] action", "search_query": "[competitor] [action] UK {time_period}"}}
-    ]}}"""
-    
-    response = anthropic_client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=1000,
-        messages=[{"role": "user", "content": comp_prompt}]
-    )
+    Return ONLY a JSON object like:
+    {{"hypotheses": [{{"id": "C1", "hypothesis": "competitor action", "search_query": "Zara campaign UK 2025"}}]}}"""
     
     try:
+        response = anthropic_client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": comp_prompt}]
+        )
         content = response.content[0].text
-        json_match = re.search(r'\{.*?\}', content, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group())
-            hypotheses["competitive"] = data.get("hypotheses", [])
-    except:
-        pass
+        data = extract_json(content)
+        hypotheses["competitive"] = data.get("hypotheses", [])
+    except Exception as e:
+        print(f"Competitive hypothesis error: {e}")
+    
+    # Fallback competitive hypotheses  
+    if not hypotheses["competitive"]:
+        comp_fallback = competitors[:4] if competitors else ["Zara", "H&M", "Primark"]
+        hypotheses["competitive"] = [
+            {"id": "C1", "hypothesis": f"{comp_fallback[0]} launched major marketing campaign", "search_query": f"{comp_fallback[0]} marketing campaign UK {time_period}"},
+            {"id": "C2", "hypothesis": f"{comp_fallback[1] if len(comp_fallback) > 1 else comp_fallback[0]} store expansion or new initiatives", "search_query": f"{comp_fallback[1] if len(comp_fallback) > 1 else comp_fallback[0]} stores UK {time_period}"},
+            {"id": "C3", "hypothesis": "Competitor news or media dominance", "search_query": f"UK fashion retailers competition {time_period}"}
+        ]
     
     return hypotheses
 
@@ -230,11 +276,14 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
     """Process each hypothesis: search + validate in parallel"""
     
     results = {"market": [], "brand": [], "competitive": []}
+    errors = []
     
     all_tasks = []
     for cat in ["market", "brand", "competitive"]:
         for hyp in hypotheses.get(cat, []):
             all_tasks.append((hyp, cat))
+    
+    print(f"Processing {len(all_tasks)} hypotheses...")
     
     def process_one(hyp, cat):
         query = hyp.get("search_query", hyp.get("hypothesis", ""))
@@ -243,6 +292,7 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
         
         # Tavily search
         try:
+            print(f"Searching: {query[:50]}...")
             search_result = tavily_client.search(
                 query=query,
                 search_depth="basic",
@@ -250,9 +300,12 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
                 include_raw_content=True
             )
             
+            print(f"Found {len(search_result.get('results', []))} results for: {query[:30]}...")
+            
             if search_result.get("results"):
                 # Validate using Claude
                 validation = validate_hypothesis(hyp, search_result["results"])
+                print(f"Validation: {validation.get('validated')} - {validation.get('evidence', '')[:50]}...")
                 if validation.get("validated"):
                     return {
                         "status": "VALIDATED",
@@ -262,7 +315,10 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
                         "source_title": search_result["results"][0].get("title")
                     }
         except Exception as e:
-            pass
+            error_msg = f"Tavily error for '{query[:30]}...': {str(e)}"
+            print(error_msg)
+            errors.append(error_msg)
+            return {"error": str(e), "category": cat}
         
         return None
     
@@ -273,10 +329,14 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
             hyp, cat = future_to_task[future]
             try:
                 result = future.result()
-                if result:
+                if result and "error" not in result:
                     results[cat].append(result)
-            except:
-                pass
+            except Exception as e:
+                print(f"Thread error: {e}")
+    
+    print(f"Results: market={len(results['market'])}, brand={len(results['brand'])}, competitive={len(results['competitive'])}")
+    if errors:
+        print(f"Errors encountered: {len(errors)}")
     
     return results
 
@@ -324,7 +384,9 @@ def build_summary(validated: Dict) -> Dict[str, List[Dict]]:
                     "driver": item.get("evidence", item.get("hypothesis", "")),
                     "hypothesis": item.get("hypothesis", ""),
                     "source_urls": [item.get("source")] if item.get("source") else [],
-                    "confidence": "medium"
+                    "source_title": item.get("source_title", ""),
+                    "confidence": "medium",
+                    "status": item.get("status")
                 })
     
     return summary

@@ -95,11 +95,19 @@ export function ChatInterface() {
         }
       } else {
         // Has findings - normal response - transform backend fields to frontend Driver interface
+        const extractHostname = (url: string): string => {
+          try {
+            return new URL(url).hostname.replace('www.', '')
+          } catch {
+            return 'Source'
+          }
+        }
+        
         const transformDriver = (d: any): Driver => ({
           hypothesis: d.hypothesis || '',
           evidence: d.driver || d.evidence || '',
-          url: d.source_urls?.[0] || d.url || '',
-          source: d.source_title || (d.source_urls?.[0] ? new URL(d.source_urls[0]).hostname.replace('www.', '') : 'Source')
+          url: d.source_urls?.[0] || d.source || d.url || '',
+          source: d.source_title || (d.source_urls?.[0] ? extractHostname(d.source_urls[0]) : d.source ? extractHostname(d.source) : 'Source')
         })
 
         assistantMessage = {
