@@ -32,6 +32,7 @@ export function ChatInterface() {
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic')
+  const [streamingEnabled, setStreamingEnabled] = useState(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -58,36 +59,6 @@ export function ChatInterface() {
     setIsLoading(true)
 
     try {
-      // Create a placeholder assistant message we will update as SSE events arrive
-      const assistantId = (Date.now() + 1).toString()
-      setMessages(prev => [
-        ...prev,
-        {
-          id: assistantId,
-          role: 'assistant',
-          content: 'Researching…',
-          provider
-        }
-      ])
-
-      const response = await fetch(`${API_URL}/research/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: input, provider })
-      })
-
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status}`)
-      }
-
-      if (!response.body) {
-        throw new Error('Streaming not supported by browser')
-      }
-
-      const decoder = new TextDecoder()
-      const reader = response.body.getReader()
-      let buffer = ''
-
       const extractHostname = (url: string): string => {
         try {
           return new URL(url).hostname.replace('www.', '')
@@ -102,6 +73,89 @@ export function ChatInterface() {
         url: d.source_urls?.[0] || d.source || d.url || '',
         source: d.source_title || (d.source_urls?.[0] ? extractHostname(d.source_urls[0]) : d.source ? extractHostname(d.source) : 'Source')
       })
+
+      const assistantId = (Date.now() + 1).toString()
+
+      // Helper to finalize message from a full JSON payload (used by both modes)
+      const buildAssistantFromData = (data: any): Message => {
+        const hasFindings =
+          (data.summary?.macro_drivers?.length || 0) > 0 ||
+          (data.summary?.brand_drivers?.length || 0) > 0 ||
+          (data.summary?.competitive_drivers?.length || 0) > 0
+
+        if (!hasFindings) {
+          return {
+            id: assistantId,
+            role: 'assistant',
+            content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
+            provider: data.provider_used || provider,
+            thinking: [
+              ...(data.validated_hypotheses?.market || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
+              ...(data.validated_hypotheses?.brand || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
+              ...(data.validated_hypotheses?.competitive || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`)
+            ],
+            drivers: { macro: [], brand: [], competitive: [] }
+          }
+        }
+
+        return {
+          id: assistantId,
+          role: 'assistant',
+          content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
+          provider: data.provider_used || provider,
+          thinking: [
+            ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
+            ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
+            ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
+          ],
+          drivers: {
+            macro: (data.summary?.macro_drivers || []).map(transformDriver),
+            brand: (data.summary?.brand_drivers || []).map(transformDriver),
+            competitive: (data.summary?.competitive_drivers || []).map(transformDriver)
+          }
+        }
+      }
+
+      // Add placeholder assistant message
+      setMessages(prev => [
+        ...prev,
+        {
+          id: assistantId,
+          role: 'assistant',
+          content: streamingEnabled ? 'Researching… (streaming)' : 'Researching…',
+          provider
+        }
+      ])
+
+      if (!streamingEnabled) {
+        // Non-streaming mode (wait for full response)
+        const response = await fetch(`${API_URL}/research`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: input, provider })
+        })
+
+        if (!response.ok) throw new Error(`API error: ${response.status}`)
+
+        const data = await response.json()
+        const finalMsg = buildAssistantFromData(data)
+        setMessages(prev => prev.map(m => (m.id === assistantId ? finalMsg : m)))
+        return
+      }
+
+      // Streaming mode (SSE)
+      const response = await fetch(`${API_URL}/research/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: input, provider })
+      })
+
+      if (!response.ok) throw new Error(`API error: ${response.status}`)
+      if (!response.body) throw new Error('Streaming not supported by browser')
+
+      const decoder = new TextDecoder()
+      const reader = response.body.getReader()
+      let buffer = ''
 
       const updateAssistant = (patch: Partial<Message>) => {
         setMessages(prev => prev.map(m => (m.id === assistantId ? { ...m, ...patch } : m)))
@@ -144,47 +198,8 @@ export function ChatInterface() {
           }
 
           if (event === 'final') {
-            const hasFindings =
-              (data.summary?.macro_drivers?.length || 0) > 0 ||
-              (data.summary?.brand_drivers?.length || 0) > 0 ||
-              (data.summary?.competitive_drivers?.length || 0) > 0
-
-            let assistantMessage: Message
-
-            if (!hasFindings) {
-              assistantMessage = {
-                id: assistantId,
-                role: 'assistant',
-                content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
-                provider: data.provider_used || provider,
-                thinking: [
-                  ...(data.validated_hypotheses?.market || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
-                  ...(data.validated_hypotheses?.brand || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
-                  ...(data.validated_hypotheses?.competitive || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`)
-                ],
-                drivers: { macro: [], brand: [], competitive: [] }
-              }
-            } else {
-              assistantMessage = {
-                id: assistantId,
-                role: 'assistant',
-                content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
-                provider: data.provider_used || provider,
-                thinking: [
-                  ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
-                  ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
-                  ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
-                ],
-                drivers: {
-                  macro: (data.summary?.macro_drivers || []).map(transformDriver),
-                  brand: (data.summary?.brand_drivers || []).map(transformDriver),
-                  competitive: (data.summary?.competitive_drivers || []).map(transformDriver)
-                }
-              }
-            }
-
-            // Replace placeholder with final structured message
-            setMessages(prev => prev.map(m => (m.id === assistantId ? assistantMessage : m)))
+            const finalMsg = buildAssistantFromData(data)
+            setMessages(prev => prev.map(m => (m.id === assistantId ? finalMsg : m)))
           }
         }
       }
@@ -296,9 +311,9 @@ export function ChatInterface() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Provider Toggle */}
+      {/* Provider + Streaming Toggle */}
       <div className="px-4 py-2 bg-slate-50 border-t border-slate-200">
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between">
             <span className="text-xs text-slate-500">LLM Provider:</span>
             <div className="flex gap-2">
@@ -326,9 +341,21 @@ export function ChatInterface() {
               </button>
             </div>
           </div>
-          <p className="text-[10px] text-slate-400">
-            All API keys stored in Azure Key Vault • No inline secrets
-          </p>
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-2 text-xs text-slate-500 select-none">
+              <input
+                type="checkbox"
+                checked={streamingEnabled}
+                onChange={(e) => setStreamingEnabled(e.target.checked)}
+                disabled={isLoading}
+                className="rounded border-slate-300"
+              />
+              Streaming
+            </label>
+            <p className="text-[10px] text-slate-400">
+              All API keys stored in Azure Key Vault • No inline secrets
+            </p>
+          </div>
         </div>
       </div>
 
