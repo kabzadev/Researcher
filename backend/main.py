@@ -242,32 +242,63 @@ def research_stream(req: ResearchRequest):
         validated = {"market": [], "brand": [], "competitive": []}
         yield sse("status", {"stage": "search", "total_hypotheses": len(tasks)})
 
+        def refine_query(original: str) -> str:
+            brand = parsed.get("brand") or ""
+            tp = parsed.get("time_period") or ""
+            region = "UK" if "uk" not in original.lower() else ""
+            return " ".join([original, brand, tp, region, "retail"]).strip()
+
         def process_one(hyp: Dict, cat: str) -> Dict:
             query = hyp.get("search_query") or hyp.get("hypothesis") or ""
             if not query:
                 return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
 
-            search_result = tavily.search(
+            # Pass 1
+            sr1 = tavily.search(
                 query=query,
                 search_depth="basic",
                 max_results=3,
                 include_raw_content=True,
             )
-            results = search_result.get("results", []) or []
+            r1 = sr1.get("results", []) or []
             validation = {"validated": False, "evidence": ""}
-            if results:
-                validation = validate_hypothesis(hyp, results, provider=provider)
+            if r1:
+                validation = validate_hypothesis(hyp, r1, provider=provider)
+
+            # Option A second pass when weak
+            second_pass_used = False
+            second_query = None
+            if (not r1) or (len(r1) < 2) or (not validation.get("validated")):
+                q2 = refine_query(query)
+                if q2 and q2 != query:
+                    second_pass_used = True
+                    second_query = q2
+                    sr2 = tavily.search(
+                        query=q2,
+                        search_depth="basic",
+                        max_results=3,
+                        include_raw_content=True,
+                    )
+                    r2 = sr2.get("results", []) or []
+                    combined = (r1 + r2)[:4]
+                    if combined:
+                        validation2 = validate_hypothesis(hyp, combined, provider=provider)
+                        if validation2.get("validated"):
+                            validation = validation2
+                            r1 = combined
 
             return {
                 "category": cat,
                 "hypothesis": hyp.get("hypothesis"),
                 "search_query": query,
+                "second_pass_used": second_pass_used,
+                "second_query": second_query,
                 "validated": bool(validation.get("validated")),
                 "confidence": hyp.get("confidence"),
                 "evidence": validation.get("evidence", ""),
-                "source": (results[0].get("url") if results else None),
-                "source_title": (results[0].get("title") if results else None),
-                "result_count": len(results),
+                "source": (r1[0].get("url") if r1 else None),
+                "source_title": (r1[0].get("title") if r1 else None),
+                "result_count": len(r1),
             }
 
         with ThreadPoolExecutor(max_workers=5) as executor:
@@ -473,53 +504,89 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     return hypotheses
 
 def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None) -> Dict[str, List[Dict]]:
-    """Process each hypothesis: search + validate in parallel"""
-    
+    """Process each hypothesis: search + validate in parallel.
+
+    Implements a targeted second-pass search (Option A) when the first pass is weak.
+    """
+
     results = {"market": [], "brand": [], "competitive": []}
     errors = []
-    
+
     all_tasks = []
     for cat in ["market", "brand", "competitive"]:
         for hyp in hypotheses.get(cat, []):
             all_tasks.append((hyp, cat))
-    
+
     print(f"Processing {len(all_tasks)} hypotheses...")
-    
+
+    tavily = get_tavily_client()
+
+    def refine_query(original: str) -> str:
+        # Cheap, deterministic refinement (no extra LLM calls)
+        brand = parsed.get("brand") or ""
+        tp = parsed.get("time_period") or ""
+        region = "UK" if "uk" not in original.lower() else ""
+        return " ".join([original, brand, tp, region, "retail"]).strip()
+
     def process_one(hyp, cat):
         query = hyp.get("search_query", hyp.get("hypothesis", ""))
         if not query:
             return None
-        
-        # Tavily search
+
         try:
+            # Pass 1
             print(f"Searching: {query[:50]}...")
-            search_result = tavily_client.search(
+            sr1 = tavily.search(
                 query=query,
                 search_depth="basic",
                 max_results=3,
-                include_raw_content=True
+                include_raw_content=True,
             )
-            
-            print(f"Found {len(search_result.get('results', []))} results for: {query[:30]}...")
-            
-            if search_result.get("results"):
-                # Validate using LLM
-                validation = validate_hypothesis(hyp, search_result["results"], provider=provider)
+            r1 = sr1.get("results", []) or []
+            print(f"Found {len(r1)} results for: {query[:30]}...")
+
+            validation = {"validated": False, "evidence": ""}
+            if r1:
+                validation = validate_hypothesis(hyp, r1, provider=provider)
                 print(f"Validation: {validation.get('validated')} - {validation.get('evidence', '')[:50]}...")
-                if validation.get("validated"):
-                    return {
-                        "status": "VALIDATED",
-                        "hypothesis": hyp.get("hypothesis"),
-                        "evidence": validation.get("evidence"),
-                        "source": search_result["results"][0].get("url"),
-                        "source_title": search_result["results"][0].get("title")
-                    }
+
+            # Option A: targeted second-pass when weak
+            second_pass_used = False
+            if (not r1) or (len(r1) < 2) or (not validation.get("validated")):
+                q2 = refine_query(query)
+                if q2 and q2 != query:
+                    second_pass_used = True
+                    print(f"2nd-pass search: {q2[:60]}...")
+                    sr2 = tavily.search(
+                        query=q2,
+                        search_depth="basic",
+                        max_results=3,
+                        include_raw_content=True,
+                    )
+                    r2 = sr2.get("results", []) or []
+                    combined = (r1 + r2)[:4]
+                    if combined:
+                        validation2 = validate_hypothesis(hyp, combined, provider=provider)
+                        if validation2.get("validated"):
+                            validation = validation2
+                            r1 = combined
+
+            if r1 and validation.get("validated"):
+                return {
+                    "status": "VALIDATED",
+                    "hypothesis": hyp.get("hypothesis"),
+                    "evidence": validation.get("evidence"),
+                    "source": r1[0].get("url"),
+                    "source_title": r1[0].get("title"),
+                    "second_pass_used": second_pass_used,
+                }
+
         except Exception as e:
             error_msg = f"Tavily error for '{query[:30]}...': {str(e)}"
             print(error_msg)
             errors.append(error_msg)
             return {"error": str(e), "category": cat}
-        
+
         return None
     
     with ThreadPoolExecutor(max_workers=5) as executor:
