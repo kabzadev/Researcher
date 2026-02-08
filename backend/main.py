@@ -19,13 +19,18 @@ from tavily import TavilyClient
 
 app = FastAPI(title="Researcher API", version="0.1.0")
 
-# CORS for frontend
+# CORS for frontend - explicitly allow the static web app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=[
+        "https://orange-island-01010220f.2.azurestaticapps.net",
+        "http://localhost:5173",  # Local dev
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    max_age=3600,
 )
 
 # Initialize clients
@@ -56,34 +61,45 @@ COMPETITOR_DB = {
 def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-@app.post("/research", response_model=ResearchResponse)
+@app.post("/research")
 def research(req: ResearchRequest):
     """Main research endpoint - hypothesis-driven analysis"""
     
-    # Step 1: Parse question
-    parsed = parse_question(req.question)
-    
-    # Step 2: Get competitors
-    competitors = COMPETITOR_DB.get(parsed["brand"], [])
-    
-    # Step 3: Generate hypotheses
-    hypotheses = generate_hypotheses(parsed, competitors)
-    
-    # Step 4: Process hypotheses in parallel (search + validate)
-    validated = process_hypotheses_parallel(hypotheses, parsed)
-    
-    # Step 5: Build summary
-    summary = build_summary(validated)
-    
-    return ResearchResponse(
-        question=req.question,
-        brand=parsed["brand"],
-        direction=parsed["direction"],
-        time_period=parsed.get("time_period"),
-        hypotheses=hypotheses,
-        validated_findings=validated,
-        summary=summary
-    )
+    try:
+        # Step 1: Parse question
+        parsed = parse_question(req.question)
+        
+        # Step 2: Get competitors
+        competitors = COMPETITOR_DB.get(parsed["brand"], [])
+        
+        # Step 3: Generate hypotheses
+        hypotheses = generate_hypotheses(parsed, competitors)
+        
+        # Step 4: Process hypotheses in parallel (search + validate)
+        validated = process_hypotheses_parallel(hypotheses, parsed)
+        
+        # Step 5: Build summary
+        summary = build_summary(validated)
+        
+        return ResearchResponse(
+            question=req.question,
+            brand=parsed["brand"],
+            direction=parsed["direction"],
+            time_period=parsed.get("time_period"),
+            hypotheses=hypotheses,
+            validated_findings=validated,
+            summary=summary
+        )
+    except anthropic.BadRequestError as e:
+        error_msg = str(e)
+        if "credit balance is too low" in error_msg or "purchase credits" in error_msg:
+            raise HTTPException(
+                status_code=402,
+                detail="API credits exhausted. Please add credits to your Anthropic account at https://console.anthropic.com/settings/plans"
+            )
+        raise HTTPException(status_code=400, detail=f"AI model error: {error_msg}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Research error: {str(e)}")
 
 def parse_question(question: str) -> Dict:
     """Extract brand, metric, direction from question using Claude"""

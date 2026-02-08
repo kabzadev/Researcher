@@ -20,69 +20,6 @@ interface Driver {
   url?: string
 }
 
-const MOCK_RESPONSE: Message = {
-  id: '2',
-  role: 'assistant',
-  content: 'Based on my research, here are the external factors that may have contributed to the decrease in mental availability:',
-  thinking: [
-    '✅ Online shopping shift reduces high-street exposure',
-    '❌ Competitor advertising increase',
-    '✅ Store closures in key locations',
-    '✅ Economic downturn affecting fashion spending',
-    '❌ Celebrity partnership campaign',
-  ],
-  drivers: {
-    macro: [
-      {
-        hypothesis: 'Online shopping shift reduces high-street brand exposure',
-        evidence: 'UK online fashion sales grew 12.3% in 2025, while high-street footfall declined 8.7%. Less incidental brand encounters.',
-        source: 'ft.com',
-        url: 'https://ft.com/fashion-retail-2025'
-      },
-      {
-        hypothesis: 'Economic downturn affecting discretionary spending',
-        evidence: '77% of UK adults plan to reduce fashion spending in 2025 due to cost-of-living pressures.',
-        source: 'marketingweek.com',
-        url: 'https://marketingweek.com/uk-consumer-spending'
-      },
-      {
-        hypothesis: 'Competitor media dominance in Q3 2025',
-        evidence: 'Rivals increased marketing spend by estimated 15-20% during same period, capturing consumer attention.',
-        source: 'thedrum.com',
-        url: 'https://thedrum.com/fashion-marketing'
-      }
-    ],
-    brand: [
-      {
-        hypothesis: 'Closure of key high-street stores',
-        evidence: 'New Look closed 12 underperforming stores in Q3 2025, reducing physical brand presence in major shopping areas.',
-        source: 'bloomberg.com',
-        url: 'https://bloomberg.com/new-look-stores'
-      }
-    ],
-    competitive: [
-      {
-        hypothesis: 'Zara celebrity tie-in campaign',
-        evidence: 'Zara launched major celebrity partnership in September 2025, generating significant media coverage and social buzz.',
-        source: 'adage.com',
-        url: 'https://adage.com/zara-campaign'
-      },
-      {
-        hypothesis: 'H&M AI-powered digital campaign',
-        evidence: 'H&M introduced AI-driven personalization campaign with heavy digital ad spend across Q3 2025.',
-        source: 'campaignlive.com',
-        url: 'https://campaignlive.com/hm-ai'
-      },
-      {
-        hypothesis: 'M&S heavy media coverage',
-        evidence: 'Marks & Spencer dominated fashion trade press in Q3 with sustainability initiative and new collection launches.',
-        source: 'marketingweek.com',
-        url: 'https://marketingweek.com/ms-coverage'
-      }
-    ]
-  }
-}
-
 export function ChatInterface() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -103,6 +40,8 @@ export function ChatInterface() {
     scrollToBottom()
   }, [messages])
 
+  const API_URL = 'https://researcher-api.thankfulwave-8ed54622.eastus2.azurecontainerapps.io'
+
   const handleSend = async () => {
     if (!input.trim() || isLoading) return
 
@@ -116,11 +55,56 @@ export function ChatInterface() {
     setInput('')
     setIsLoading(true)
 
-    // Simulate API delay
-    await new Promise(resolve => setTimeout(resolve, 2000))
+    try {
+      const response = await fetch(`${API_URL}/research`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: input })
+      })
 
-    setMessages(prev => [...prev, MOCK_RESPONSE])
-    setIsLoading(false)
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`)
+      }
+
+      const data = await response.json()
+
+      // Transform API response to Message format
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
+        thinking: [
+          ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
+          ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
+          ...(data.validated_hypotheses?.competitive || []).map((h: any) => `✅ ${h.hypothesis}`)
+        ],
+        drivers: {
+          macro: data.summary?.macro_drivers || [],
+          brand: data.summary?.brand_drivers || [],
+          competitive: data.summary?.competitive_drivers || []
+        }
+      }
+
+      setMessages(prev => [...prev, assistantMessage])
+    } catch (error: any) {
+      let errorMsg = "Sorry, there was an error processing your request."
+      
+      if (error.response?.status === 402) {
+        errorMsg = "⚠️ **API Credits Exhausted**\n\nThe Anthropic API key has no remaining credits. Please add credits at:\nhttps://console.anthropic.com/settings/plans\n\nAlternatively, we can switch to OpenAI if you have credits there."
+      } else if (error.response?.status === 500) {
+        errorMsg = "⚠️ **Server Error**\n\nThe research service encountered an error. Please try again in a moment."
+      } else if (error.message?.includes('CORS')) {
+        errorMsg = "⚠️ **Connection Error**\n\nCannot connect to the research API. The service may be starting up (cold start takes ~30 seconds). Please try again."
+      }
+      
+      setMessages(prev => [...prev, {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant',
+        content: errorMsg
+      }])
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   return (
