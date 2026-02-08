@@ -15,6 +15,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+
+# Observability (Application Insights)
+try:
+    from azure.monitor.opentelemetry import configure_azure_monitor
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+except Exception:
+    configure_azure_monitor = None
+    FastAPIInstrumentor = None
+    RequestsInstrumentor = None
 from pydantic import BaseModel, Field
 import anthropic
 import openai
@@ -22,6 +32,19 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 app = FastAPI(title="Researcher API", version="0.1.0")
+
+# Configure Application Insights / Azure Monitor OpenTelemetry (best practice)
+# Uses APPLICATIONINSIGHTS_CONNECTION_STRING from Key Vault.
+if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING") and configure_azure_monitor:
+    try:
+        configure_azure_monitor()
+        if RequestsInstrumentor:
+            RequestsInstrumentor().instrument()
+        if FastAPIInstrumentor:
+            FastAPIInstrumentor.instrument_app(app)
+        print("✓ Application Insights telemetry enabled")
+    except Exception as e:
+        print(f"⚠ Failed to enable Application Insights telemetry: {e}")
 
 # CORS for frontend - explicitly allow the static web app
 app.add_middleware(
