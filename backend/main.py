@@ -1,6 +1,7 @@
 """
 Researcher API - Hypothesis-driven brand metric analysis
-Uses Anthropic Claude + Tavily Search
+Supports both Anthropic Claude and OpenAI
+Uses Tavily for web search
 """
 
 import os
@@ -13,8 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import anthropic
+from openai import OpenAI
 from tavily import TavilyClient
 
 app = FastAPI(title="Researcher API", version="0.1.0")
@@ -34,12 +36,43 @@ app.add_middleware(
 )
 
 # Initialize clients
-anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+anthropic_client = None
+openai_client = None
+tavily_client = None
+
+def get_anthropic_client():
+    global anthropic_client
+    if anthropic_client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if api_key:
+            anthropic_client = anthropic.Anthropic(api_key=api_key)
+    return anthropic_client
+
+def get_openai_client():
+    global openai_client
+    if openai_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            openai_client = OpenAI(api_key=api_key)
+    return openai_client
+
+def get_tavily_client():
+    global tavily_client
+    if tavily_client is None:
+        api_key = os.getenv("TAVILY_API_KEY")
+        if api_key:
+            tavily_client = TavilyClient(api_key=api_key)
+    return tavily_client
+
+# LLM Configuration
+DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "anthropic")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Models
 class ResearchRequest(BaseModel):
     question: str
+    provider: Optional[str] = Field(default=None, description="LLM provider: 'anthropic' or 'openai'. Uses DEFAULT_LLM_PROVIDER env var if not specified.")
 
 class ResearchResponse(BaseModel):
     question: str
@@ -47,9 +80,44 @@ class ResearchResponse(BaseModel):
     metrics: List[str]  # Frontend expects array
     direction: str
     time_period: Optional[str]
+    provider_used: str  # Which LLM provider was actually used
     hypotheses: Dict[str, List[Dict]]
-    validated_hypotheses: Dict[str, List[Dict]]  # Changed from validated_findings
+    validated_hypotheses: Dict[str, List[Dict]]
     summary: Dict[str, List[Dict]]
+
+# LLM Abstraction Layer
+def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 1000) -> str:
+    """Generate text using the specified LLM provider"""
+    
+    # Determine which provider to use
+    chosen_provider = provider or DEFAULT_PROVIDER
+    
+    if chosen_provider == "anthropic":
+        client = get_anthropic_client()
+        if not client:
+            raise HTTPException(status_code=503, detail="Anthropic API key not configured")
+        
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    
+    elif chosen_provider == "openai":
+        client = get_openai_client()
+        if not client:
+            raise HTTPException(status_code=503, detail="OpenAI API key not configured")
+        
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content or ""
+    
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {chosen_provider}. Use 'anthropic' or 'openai'.")
 
 # Competitor Database
 COMPETITOR_DB = {
@@ -66,18 +134,21 @@ def health_check():
 def research(req: ResearchRequest):
     """Main research endpoint - hypothesis-driven analysis"""
     
+    # Determine which provider to use (request param > env var > default)
+    provider = req.provider or DEFAULT_PROVIDER
+    
     try:
         # Step 1: Parse question
-        parsed = parse_question(req.question)
+        parsed = parse_question(req.question, provider=provider)
         
         # Step 2: Get competitors
         competitors = COMPETITOR_DB.get(parsed["brand"], [])
         
         # Step 3: Generate hypotheses
-        hypotheses = generate_hypotheses(parsed, competitors)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider)
         
         # Step 4: Process hypotheses in parallel (search + validate)
-        validated = process_hypotheses_parallel(hypotheses, parsed)
+        validated = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
         
         # Step 5: Build summary
         summary = build_summary(validated)
@@ -97,6 +168,7 @@ def research(req: ResearchRequest):
             metrics=metrics_arr,
             direction=parsed["direction"],
             time_period=parsed.get("time_period"),
+            provider_used=provider,
             hypotheses=hypotheses,
             validated_hypotheses=validated,
             summary=summary
@@ -108,12 +180,20 @@ def research(req: ResearchRequest):
                 status_code=402,
                 detail="API credits exhausted. Please add credits to your Anthropic account at https://console.anthropic.com/settings/plans"
             )
-        raise HTTPException(status_code=400, detail=f"AI model error: {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Anthropic model error: {error_msg}")
+    except openai.BadRequestError as e:
+        error_msg = str(e)
+        if "insufficient_quota" in error_msg or "billing" in error_msg:
+            raise HTTPException(
+                status_code=402,
+                detail="API credits exhausted. Please check your OpenAI account billing at https://platform.openai.com/settings/organization/billing/overview"
+            )
+        raise HTTPException(status_code=400, detail=f"OpenAI model error: {error_msg}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Research error: {str(e)}")
 
-def parse_question(question: str) -> Dict:
-    """Extract brand, metric, direction from question using Claude"""
+def parse_question(question: str, provider: Optional[str] = None) -> Dict:
+    """Extract brand, metric, direction from question using LLM"""
     
     prompt = f"""Parse this brand research question and extract:
     - brand: The brand being discussed (lowercase)
@@ -125,19 +205,14 @@ def parse_question(question: str) -> Dict:
     
     Return ONLY valid JSON with these exact keys."""
     
-    response = anthropic_client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
     try:
-        content = response.content[0].text
+        content = llm_generate(prompt, provider=provider, max_tokens=500)
         # Extract JSON from response
         json_match = re.search(r'\{.*?\}', content, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
-    except:
+    except Exception as e:
+        print(f"Parse question error: {e}")
         pass
     
     return {"brand": "unknown", "metric": "salient", "direction": "change", "time_period": None}
@@ -172,7 +247,7 @@ def extract_json(text: str) -> Dict:
     
     return {}
 
-def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[Dict]]:
+def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional[str] = None) -> Dict[str, List[Dict]]:
     """Generate hypotheses for market, brand, and competitive factors"""
     
     brand = parsed["brand"]
@@ -181,7 +256,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[
     
     hypotheses = {"market": [], "brand": [], "competitive": []}
     
-    # Market hypotheses - use static fallback if Claude fails
+    # Market hypotheses - use static fallback if LLM fails
     market_prompt = f"""Generate 3-4 hypotheses about UK fashion retail MARKET trends 
     that could cause {direction} in brand salience for {brand}.
     
@@ -191,12 +266,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[
     {{"hypotheses": [{{"id": "M1", "hypothesis": "description", "search_query": "UK fashion trend Q3 2025"}}]}}"""
     
     try:
-        response = anthropic_client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": market_prompt}]
-        )
-        content = response.content[0].text
+        content = llm_generate(market_prompt, provider=provider, max_tokens=1000)
         data = extract_json(content)
         hypotheses["market"] = data.get("hypotheses", [])
     except Exception as e:
@@ -221,12 +291,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[
     {{"hypotheses": [{{"id": "B1", "hypothesis": "description", "search_query": "{brand} store closures 2025"}}]}}"""
     
     try:
-        response = anthropic_client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": brand_prompt}]
-        )
-        content = response.content[0].text
+        content = llm_generate(brand_prompt, provider=provider, max_tokens=1000)
         data = extract_json(content)
         hypotheses["brand"] = data.get("hypotheses", [])
     except Exception as e:
@@ -250,12 +315,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[
     {{"hypotheses": [{{"id": "C1", "hypothesis": "competitor action", "search_query": "Zara campaign UK 2025"}}]}}"""
     
     try:
-        response = anthropic_client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": comp_prompt}]
-        )
-        content = response.content[0].text
+        content = llm_generate(comp_prompt, provider=provider, max_tokens=1000)
         data = extract_json(content)
         hypotheses["competitive"] = data.get("hypotheses", [])
     except Exception as e:
@@ -272,7 +332,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str]) -> Dict[str, List[
     
     return hypotheses
 
-def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, List[Dict]]:
+def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None) -> Dict[str, List[Dict]]:
     """Process each hypothesis: search + validate in parallel"""
     
     results = {"market": [], "brand": [], "competitive": []}
@@ -303,8 +363,8 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
             print(f"Found {len(search_result.get('results', []))} results for: {query[:30]}...")
             
             if search_result.get("results"):
-                # Validate using Claude
-                validation = validate_hypothesis(hyp, search_result["results"])
+                # Validate using LLM
+                validation = validate_hypothesis(hyp, search_result["results"], provider=provider)
                 print(f"Validation: {validation.get('validated')} - {validation.get('evidence', '')[:50]}...")
                 if validation.get("validated"):
                     return {
@@ -340,8 +400,8 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict) -> Dict[str, Lis
     
     return results
 
-def validate_hypothesis(hypothesis: Dict, search_results: List[Dict]) -> Dict:
-    """Use Claude to validate if search results support the hypothesis"""
+def validate_hypothesis(hypothesis: Dict, search_results: List[Dict], provider: Optional[str] = None) -> Dict:
+    """Use LLM to validate if search results support the hypothesis"""
     
     search_text = "\n\n".join([
         f"Title: {r.get('title', '')}\nContent: {r.get('raw_content', r.get('content', ''))[:500]}"
@@ -356,18 +416,13 @@ Search Results:
 Does this search result contain direct evidence supporting the hypothesis?
 Return JSON: {{"validated": true/false, "evidence": "SHORT factual summary (20 words max) with key numbers/dates"}}"""
     
-    response = anthropic_client.messages.create(
-        model="claude-3-5-haiku-20241022",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
     try:
-        content = response.content[0].text
+        content = llm_generate(prompt, provider=provider, max_tokens=500)
         json_match = re.search(r'\{.*?\}', content, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
-    except:
+    except Exception as e:
+        print(f"Validate hypothesis error: {e}")
         pass
     
     return {"validated": False, "evidence": ""}
