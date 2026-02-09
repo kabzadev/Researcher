@@ -81,7 +81,7 @@ export function Eval() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${appPassword}`
         },
-        body: JSON.stringify({ providerA: 'openai', providerB: 'anthropic', limit: 10 })
+        body: JSON.stringify({ providerA: 'openai', providerB: 'anthropic', limit: 3 })
       })
 
       if (!res.ok) {

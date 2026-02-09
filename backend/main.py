@@ -581,7 +581,7 @@ def eval_run(payload: dict = Body(...)):
 
     providerA = (payload.get("providerA") or "openai").lower()
     providerB = (payload.get("providerB") or "anthropic").lower()
-    limit = int(payload.get("limit") or 10)
+    limit = int(payload.get("limit") or 3)
 
     # load questions
     qs = eval_questions().get("questions", [])
