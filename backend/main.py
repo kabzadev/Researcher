@@ -271,6 +271,39 @@ def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 
 
     raise HTTPException(status_code=400, detail=f"Unknown provider: {chosen_provider}. Use 'anthropic' or 'openai'.")
 
+def _is_help_question(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    if not ql:
+        return False
+    triggers = [
+        "help",
+        "/help",
+        "what do you do",
+        "what can you do",
+        "how do i use",
+        "capabilities",
+        "supported metrics",
+    ]
+    return ql in triggers or any(ql.startswith(t) for t in ["help ", "/help "])
+
+
+def _help_payload() -> Dict[str, Any]:
+    return {
+        "kind": "help",
+        "message": (
+            "I’m a hypothesis-driven research assistant. I’m best at explaining *why a brand metric changed* by finding validating web evidence with citations.\n\n"
+            "Right now I work best with questions about **Salience / mental availability**.\n\n"
+            "For best results include: **brand**, **metric**, **direction (up/down)**, and a **time period** (and optionally a region)."
+        ),
+        "supported_metrics": ["salience"],
+        "examples": [
+            "Salience fell by 6 points in Q3 2025 for New Look — find external reasons with citations.",
+            "Salience increased in Q4 2025 for Nike in China — what external events could explain it? Provide citations.",
+        ],
+        "note": "If you ask competitor-landscape or underperformance-by-market questions without a metric/timeframe, I’ll ask for clarification.",
+    }
+
+
 def _looks_like_metric_change(q: str) -> bool:
     ql = (q or "").lower()
     metric_words = ["salience", "awareness", "consideration", "preference", "intent", "nps", "share of voice"]
@@ -380,6 +413,100 @@ def research(req: ResearchRequest):
     )
 
     try:
+        # Help shortcut
+        if _is_help_question(req.question):
+            latency_ms = int((time.time() - started_at) * 1000)
+            help_payload = _help_payload()
+            RUN_LOG.append(
+                {
+                    "run_id": run_id,
+                    "started_at": datetime.now().isoformat(),
+                    "latency_ms": latency_ms,
+                    "provider": provider,
+                    "question": req.question,
+                    "brand": None,
+                    "time_period": None,
+                    "tavily_searches": 0,
+                    "tavily_second_passes": 0,
+                    "llm_calls": int((_run_ctx.get() or {}).get("llm_calls", 0) or 0),
+                    "tokens_in": int((_run_ctx.get() or {}).get("tokens_in", 0) or 0),
+                    "tokens_out": int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
+                    "tokens_total": int((_run_ctx.get() or {}).get("tokens_in", 0) or 0) + int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
+                    "help": True,
+                }
+            )
+
+            return ResearchResponse(
+                question=req.question,
+                brand="help",
+                metrics=["salient"],
+                direction="change",
+                time_period=None,
+                provider_used=provider,
+                hypotheses={"market": [], "brand": [], "competitive": []},
+                validated_hypotheses={"market": [], "brand": [], "competitive": []},
+                summary={"macro_drivers": [], "brand_drivers": [], "competitive_drivers": []},
+                coaching=help_payload,
+                run_id=run_id,
+                latency_ms=latency_ms,
+                tavily_searches=0,
+                tavily_second_passes=0,
+                llm_calls=int((_run_ctx.get() or {}).get("llm_calls", 0) or 0),
+                tokens_in=int((_run_ctx.get() or {}).get("tokens_in", 0) or 0),
+                tokens_out=int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
+                tokens_total=int((_run_ctx.get() or {}).get("tokens_in", 0) or 0) + int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
+            )
+
+        # STRICT coaching mode: if question isn't a metric-change question, coach instead of forcing the pipeline
+        if not _looks_like_metric_change(req.question):
+            brand_guess = "unknown"
+            m = re.search(r"\b([A-Z][A-Za-z0-9&\- ]{1,30})\b", req.question)
+            if m:
+                brand_guess = m.group(1).strip().lower()
+
+            latency_ms = int((time.time() - started_at) * 1000)
+            coaching = _coaching_payload(req.question, brand_hint=brand_guess)
+
+            run_summary = {
+                "run_id": run_id,
+                "started_at": datetime.now().isoformat(),
+                "latency_ms": latency_ms,
+                "provider": provider,
+                "question": req.question,
+                "brand": brand_guess,
+                "time_period": None,
+                "tavily_searches": 0,
+                "tavily_second_passes": 0,
+                "llm_calls": int((_run_ctx.get() or {}).get("llm_calls", 0) or 0),
+                "tokens_in": int((_run_ctx.get() or {}).get("tokens_in", 0) or 0),
+                "tokens_out": int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
+                "tokens_total": int((_run_ctx.get() or {}).get("tokens_in", 0) or 0) + int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
+                "validated_counts": {"market": 0, "brand": 0, "competitive": 0},
+                "coached": True,
+            }
+            RUN_LOG.append(run_summary)
+
+            return ResearchResponse(
+                question=req.question,
+                brand=brand_guess,
+                metrics=["salient"],
+                direction="change",
+                time_period=None,
+                provider_used=provider,
+                hypotheses={"market": [], "brand": [], "competitive": []},
+                validated_hypotheses={"market": [], "brand": [], "competitive": []},
+                summary={"macro_drivers": [], "brand_drivers": [], "competitive_drivers": []},
+                coaching=coaching,
+                run_id=run_id,
+                latency_ms=latency_ms,
+                tavily_searches=0,
+                tavily_second_passes=0,
+                llm_calls=run_summary["llm_calls"],
+                tokens_in=run_summary["tokens_in"],
+                tokens_out=run_summary["tokens_out"],
+                tokens_total=run_summary["tokens_total"],
+            )
+
         # Step 1: Parse question
         parsed = parse_question(req.question, provider=provider)
         
@@ -493,6 +620,22 @@ def research_stream(req: ResearchRequest):
     def event_gen():
         started_at = datetime.now()
         yield sse("status", {"stage": "start", "provider": provider})
+
+        # Help shortcut (stream)
+        if _is_help_question(req.question):
+            yield sse("final", {
+                "question": req.question,
+                "brand": "help",
+                "metrics": ["salient"],
+                "direction": "change",
+                "time_period": None,
+                "provider_used": provider,
+                "hypotheses": {"market": [], "brand": [], "competitive": []},
+                "validated_hypotheses": {"market": [], "brand": [], "competitive": []},
+                "summary": {"macro_drivers": [], "brand_drivers": [], "competitive_drivers": []},
+                "coaching": _help_payload(),
+            })
+            return
 
         # STRICT coaching mode (stream): coach instead of forcing the pipeline
         if not _looks_like_metric_change(req.question):
