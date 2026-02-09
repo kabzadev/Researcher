@@ -16,7 +16,7 @@ import time
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -415,6 +415,7 @@ AppTraces
 
 @app.get("/telemetry/summary")
 def telemetry_summary():
+
     # Try durable query first
     lc = _logs_client()
     if lc:
@@ -484,6 +485,146 @@ AppTraces
         "tavily_second_passes": sum(int(i.get("tavily_second_passes", 0) or 0) for i in items),
         "providers": providers,
     }
+
+@app.get("/eval/questions")
+def eval_questions():
+    """Return the hardcoded eval question set."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "eval_questions.json"), "r", encoding="utf-8") as f:
+            return {"questions": json.load(f)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Eval questions load error: {e}")
+
+
+def _score_response(resp: dict) -> dict:
+    """Heuristic scoring for eval comparisons (0-100)."""
+    summary = resp.get("summary") or {}
+    macro = summary.get("macro_drivers") or []
+    brand = summary.get("brand_drivers") or []
+    comp = summary.get("competitive_drivers") or []
+
+    sections_nonempty = int(bool(macro)) + int(bool(brand)) + int(bool(comp))
+    drivers_total = len(macro) + len(brand) + len(comp)
+
+    citations = []
+    for d in (macro + brand + comp):
+        for u in (d.get("source_urls") or []):
+            if u:
+                citations.append(u)
+
+    unique_domains = set()
+    for u in citations:
+        try:
+            from urllib.parse import urlparse
+            unique_domains.add(urlparse(u).netloc.replace("www.", ""))
+        except Exception:
+            pass
+
+    citations_total = len(citations)
+    unique_domains_n = len(unique_domains)
+
+    # Simple score
+    score = 0
+    score += min(citations_total, 6) * 5  # up to 30
+    score += sections_nonempty * 10       # up to 30
+    score += min(drivers_total, 6) * 3    # up to 18
+    score += min(unique_domains_n, 5) * 2 # up to 10
+
+    if citations_total == 0:
+        score -= 10
+    if drivers_total == 0:
+        score -= 15
+
+    score = max(0, min(100, score))
+
+    return {
+        "score": score,
+        "drivers_total": drivers_total,
+        "sections_nonempty": sections_nonempty,
+        "citations_total": citations_total,
+        "unique_domains": unique_domains_n,
+    }
+
+
+@app.post("/feedback")
+def feedback(payload: dict = Body(...)):
+    """Collect thumbs up/down feedback tied to a run.
+
+    Expected payload:
+      { run_id, rating: 1|-1, comment?, question?, provider? }
+    """
+    run_id = payload.get("run_id")
+    rating = payload.get("rating")
+    if rating not in (1, -1):
+        raise HTTPException(status_code=400, detail="rating must be 1 or -1")
+
+    evt = {
+        "kind": "UserFeedback",
+        "run_id": run_id,
+        "rating": rating,
+        "comment": (payload.get("comment") or "")[:2000],
+        "question": (payload.get("question") or "")[:500],
+        "provider": payload.get("provider") or payload.get("provider_used"),
+        "timestamp": datetime.now().isoformat(),
+    }
+    _emit_run_event(evt)
+    return {"ok": True}
+
+
+@app.post("/eval/run")
+def eval_run(payload: dict = Body(...)):
+    """Run the eval set against both providers and return scores.
+
+    Payload:
+      { "providerA": "openai", "providerB": "anthropic", "limit": 10 }
+    """
+
+    providerA = (payload.get("providerA") or "openai").lower()
+    providerB = (payload.get("providerB") or "anthropic").lower()
+    limit = int(payload.get("limit") or 10)
+
+    # load questions
+    qs = eval_questions().get("questions", [])
+    qs = qs[: max(1, min(limit, len(qs)))]
+
+    results = []
+
+    for q in qs:
+        qtext = q.get("text")
+        if not qtext:
+            continue
+
+        for prov in [providerA, providerB]:
+            # call our own research function directly (no HTTP)
+            resp_model = research(ResearchRequest(question=qtext, provider=prov))
+            resp = resp_model.model_dump() if hasattr(resp_model, "model_dump") else dict(resp_model)
+
+            score = _score_response(resp)
+
+            eval_event = {
+                "kind": "EvalRun",
+                "question_id": q.get("id"),
+                "question": qtext,
+                "provider": prov,
+                "run_id": resp.get("run_id"),
+                "score": score,
+                "latency_ms": resp.get("latency_ms"),
+                "tokens_total": resp.get("tokens_total"),
+                "tavily_searches": resp.get("tavily_searches"),
+                "validated_counts": (resp.get("validated_counts") or resp.get("summary")),
+                "timestamp": datetime.now().isoformat(),
+            }
+            _emit_run_event(eval_event)
+
+            results.append({
+                "question_id": q.get("id"),
+                "provider": prov,
+                "score": score,
+                "response": resp,
+            })
+
+    return {"results": results}
+
 
 @app.post("/research")
 def research(req: ResearchRequest):
@@ -615,7 +756,9 @@ def research(req: ResearchRequest):
         hypotheses = generate_hypotheses(parsed, competitors, provider=provider)
         
         # Step 4: Process hypotheses in parallel (search + validate)
-        validated = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
+        validated, meta = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
+        _run_metric_set("tavily_searches", int(meta.get("tavily_searches", 0) or 0))
+        _run_metric_set("tavily_second_passes", int(meta.get("tavily_second_passes", 0) or 0))
         
         # Step 5: Build summary
         summary = build_summary(validated)
@@ -647,8 +790,8 @@ def research(req: ResearchRequest):
             "question": req.question,
             "brand": parsed.get("brand"),
             "time_period": parsed.get("time_period"),
-            "tavily_searches": int(ctx.get("tavily_searches", 0) or 0),
-            "tavily_second_passes": int(ctx.get("tavily_second_passes", 0) or 0),
+            "tavily_searches": int(meta.get("tavily_searches", 0) or 0),
+            "tavily_second_passes": int(meta.get("tavily_second_passes", 0) or 0),
             "llm_calls": int(ctx.get("llm_calls", 0) or 0),
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
@@ -674,8 +817,8 @@ def research(req: ResearchRequest):
             summary=summary,
             run_id=run_id,
             latency_ms=latency_ms,
-            tavily_searches=run_summary["tavily_searches"],
-            tavily_second_passes=run_summary["tavily_second_passes"],
+            tavily_searches=int(meta.get("tavily_searches", 0) or 0),
+            tavily_second_passes=int(meta.get("tavily_second_passes", 0) or 0),
             llm_calls=run_summary["llm_calls"],
             tokens_in=tokens_in,
             tokens_out=tokens_out,
@@ -1098,7 +1241,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     
     return hypotheses
 
-def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None) -> Dict[str, List[Dict]]:
+def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None) -> tuple[Dict[str, List[Dict]], Dict[str, int]]:
     """Process each hypothesis: search + validate in parallel.
 
     Implements a targeted second-pass search (Option A) when the first pass is weak.
@@ -1106,6 +1249,9 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
     results = {"market": [], "brand": [], "competitive": []}
     errors = []
+
+    tavily_searches_total = 0
+    tavily_second_passes_total = 0
 
     all_tasks = []
     for cat in ["market", "brand", "competitive"]:
@@ -1126,12 +1272,15 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
     def process_one(hyp, cat):
         query = hyp.get("search_query", hyp.get("hypothesis", ""))
         if not query:
-            return None
+            return {"category": cat, "_tavily_searches": 0, "_tavily_second_passes": 0}
+
+        local_searches = 0
+        local_second = 0
 
         try:
             # Pass 1
             print(f"Searching: {query[:50]}...")
-            _run_metric_incr("tavily_searches", 1)
+            local_searches += 1
             sr1 = tavily.search(
                 query=query,
                 search_depth="basic",
@@ -1152,9 +1301,9 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
                 q2 = refine_query(query)
                 if q2 and q2 != query:
                     second_pass_used = True
+                    local_searches += 1
+                    local_second += 1
                     print(f"2nd-pass search: {q2[:60]}...")
-                    _run_metric_incr("tavily_searches", 1)
-                    _run_metric_incr("tavily_second_passes", 1)
                     sr2 = tavily.search(
                         query=q2,
                         search_depth="basic",
@@ -1171,21 +1320,26 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
             if r1 and validation.get("validated"):
                 return {
-                    "status": "VALIDATED",
-                    "hypothesis": hyp.get("hypothesis"),
-                    "evidence": validation.get("evidence"),
-                    "source": r1[0].get("url"),
-                    "source_title": r1[0].get("title"),
-                    "second_pass_used": second_pass_used,
+                    "category": cat,
+                    "_tavily_searches": local_searches,
+                    "_tavily_second_passes": local_second,
+                    "item": {
+                        "status": "VALIDATED",
+                        "hypothesis": hyp.get("hypothesis"),
+                        "evidence": validation.get("evidence"),
+                        "source": r1[0].get("url"),
+                        "source_title": r1[0].get("title"),
+                        "second_pass_used": second_pass_used,
+                    },
                 }
+
+            return {"category": cat, "_tavily_searches": local_searches, "_tavily_second_passes": local_second}
 
         except Exception as e:
             error_msg = f"Tavily error for '{query[:30]}...': {str(e)}"
             print(error_msg)
             errors.append(error_msg)
-            return {"error": str(e), "category": cat}
-
-        return None
+            return {"category": cat, "_tavily_searches": local_searches, "_tavily_second_passes": local_second, "error": str(e)}
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_task = {executor.submit(process_one, hyp, cat): (hyp, cat) for hyp, cat in all_tasks}
@@ -1193,9 +1347,18 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
         for future in as_completed(future_to_task):
             hyp, cat = future_to_task[future]
             try:
-                result = future.result()
-                if result and "error" not in result:
-                    results[cat].append(result)
+                result = future.result() or {}
+
+                tavily_searches_total_nonlocal = int(result.get("_tavily_searches", 0) or 0)
+                tavily_second_passes_total_nonlocal = int(result.get("_tavily_second_passes", 0) or 0)
+                nonlocal_err = result.get("error")
+
+                # aggregate counts in main thread (contextvars don't propagate to threads)
+                tavily_searches_total += tavily_searches_total_nonlocal
+                tavily_second_passes_total += tavily_second_passes_total_nonlocal
+
+                if result.get("item") and not nonlocal_err:
+                    results[result.get("category", cat)].append(result["item"])
             except Exception as e:
                 print(f"Thread error: {e}")
     
@@ -1203,7 +1366,11 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
     if errors:
         print(f"Errors encountered: {len(errors)}")
     
-    return results
+    meta = {
+        "tavily_searches": tavily_searches_total,
+        "tavily_second_passes": tavily_second_passes_total,
+    }
+    return results, meta
 
 def validate_hypothesis(hypothesis: Dict, search_results: List[Dict], provider: Optional[str] = None) -> Dict:
     """Use LLM to validate if search results support the hypothesis"""

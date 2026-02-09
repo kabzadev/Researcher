@@ -6,6 +6,8 @@ interface Message {
   role: 'user' | 'assistant'
   content: string
   provider?: string
+  runId?: string
+  feedback?: 1 | -1
   drivers?: {
     macro: Driver[]
     brand: Driver[]
@@ -35,6 +37,8 @@ export function ChatInterface() {
   const [streamingEnabled, setStreamingEnabled] = useState(true)
   const [appPassword, setAppPassword] = useState<string>(() => sessionStorage.getItem('researcher_app_password') || '')
   const [passwordInput, setPasswordInput] = useState('')
+  const [feedbackModal, setFeedbackModal] = useState<{ open: boolean; messageId?: string; runId?: string; provider?: string; question?: string }>({ open: false })
+  const [feedbackText, setFeedbackText] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -88,6 +92,7 @@ export function ChatInterface() {
             id: assistantId,
             role: 'assistant',
             provider: data.provider_used || provider,
+            runId: data.run_id,
             content:
               `I can answer this, but I need 1–2 details first to avoid guessing.\n\n` +
               (need.length ? `Missing: ${need.join(', ')}\n\n` : '') +
@@ -109,6 +114,7 @@ export function ChatInterface() {
             role: 'assistant',
             content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
             provider: data.provider_used || provider,
+            runId: data.run_id,
             thinking: [
               ...(data.validated_hypotheses?.market || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
               ...(data.validated_hypotheses?.brand || []).map((h: any) => `❌ ${h.hypothesis} (no evidence)`),
@@ -123,6 +129,7 @@ export function ChatInterface() {
           role: 'assistant',
           content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
           provider: data.provider_used || provider,
+          runId: data.run_id,
           thinking: [
             ...(data.validated_hypotheses?.market || []).map((h: any) => `✅ ${h.hypothesis}`),
             ...(data.validated_hypotheses?.brand || []).map((h: any) => `✅ ${h.hypothesis}`),
@@ -323,6 +330,52 @@ export function ChatInterface() {
               )}
               <div className="whitespace-pre-wrap">{message.content}</div>
 
+              {/* Feedback */}
+              {message.role === 'assistant' && message.runId && (
+                <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+                  <button
+                    type="button"
+                    className={`px-2 py-1 rounded-lg border ${message.feedback === 1 ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-white border-slate-200 hover:bg-slate-50'}`}
+                    onClick={async () => {
+                      // optimistic UI
+                      setMessages(prev => prev.map(m => m.id === message.id ? { ...m, feedback: 1 } : m))
+                      await fetch(`${API_URL}/feedback`, {
+                        method: 'POST',
+                        headers: {
+                          'Content-Type': 'application/json',
+                          'Authorization': `Bearer ${appPassword}`
+                        },
+                        body: JSON.stringify({
+                          run_id: message.runId,
+                          rating: 1,
+                          provider: message.provider,
+                          question: messages.find(m => m.role === 'user')?.content
+                        })
+                      })
+                    }}
+                  >
+                    👍
+                  </button>
+                  <button
+                    type="button"
+                    className={`px-2 py-1 rounded-lg border ${message.feedback === -1 ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-white border-slate-200 hover:bg-slate-50'}`}
+                    onClick={() => {
+                      setFeedbackText('')
+                      setFeedbackModal({
+                        open: true,
+                        messageId: message.id,
+                        runId: message.runId,
+                        provider: message.provider,
+                        question: messages.find(m => m.role === 'user')?.content
+                      })
+                    }}
+                  >
+                    👎
+                  </button>
+                  <span className="ml-1">Run: {message.runId.slice(0, 8)}</span>
+                </div>
+              )}
+
               {/* Research Results */}
               {message.drivers && (
                 <div className="mt-4 pt-4 border-t border-slate-200">
@@ -427,6 +480,59 @@ export function ChatInterface() {
           </div>
         </div>
       </div>
+
+      {/* Feedback Modal */}
+      {feedbackModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setFeedbackModal({ open: false })} />
+          <div className="relative bg-white w-full max-w-lg rounded-2xl border border-slate-200 shadow-xl p-5">
+            <h3 className="font-semibold text-slate-900">What was wrong?</h3>
+            <p className="text-xs text-slate-500 mt-1">This helps us improve. (Stored for model/prompt tuning.)</p>
+            <textarea
+              value={feedbackText}
+              onChange={(e) => setFeedbackText(e.target.value)}
+              placeholder="e.g. missed competitor news, wrong region, no citations, too generic..."
+              className="mt-3 w-full min-h-[120px] rounded-xl border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            />
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="px-3 py-2 text-sm rounded-xl border border-slate-300 bg-white hover:bg-slate-50"
+                onClick={() => setFeedbackModal({ open: false })}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="px-3 py-2 text-sm rounded-xl bg-rose-600 text-white hover:bg-rose-700"
+                onClick={async () => {
+                  const runId = feedbackModal.runId
+                  if (feedbackModal.messageId) {
+                    setMessages(prev => prev.map(m => m.id === feedbackModal.messageId ? { ...m, feedback: -1 } : m))
+                  }
+                  await fetch(`${API_URL}/feedback`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': `Bearer ${appPassword}`
+                    },
+                    body: JSON.stringify({
+                      run_id: runId,
+                      rating: -1,
+                      comment: feedbackText,
+                      provider: feedbackModal.provider,
+                      question: feedbackModal.question
+                    })
+                  })
+                  setFeedbackModal({ open: false })
+                }}
+              >
+                Submit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Input */}
       <div className="p-4 border-t border-slate-200 bg-white">

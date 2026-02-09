@@ -3,8 +3,9 @@ import './index.css'
 import { Layout } from './components/Layout'
 import { ChatInterface } from './components/ChatInterface'
 import { Dashboard } from './components/Dashboard'
+import { Eval } from './components/Eval'
 
-type Page = 'research' | 'dashboard'
+type Page = 'research' | 'dashboard' | 'eval'
 
 function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => {
@@ -21,7 +22,7 @@ function App() {
       page={page}
       onSelectPage={setPage}
     >
-      {page === 'research' ? <ChatInterface /> : <Dashboard />}
+      {page === 'research' ? <ChatInterface /> : page === 'dashboard' ? <Dashboard /> : <Eval />}
     </Layout>
   )
 }

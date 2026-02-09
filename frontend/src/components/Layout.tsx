@@ -1,11 +1,11 @@
-import { Menu, X, Search, MessageSquare, Settings, FileText } from 'lucide-react'
+import { Menu, X, Search, MessageSquare, Settings, FileText, FlaskConical } from 'lucide-react'
 
 interface LayoutProps {
   children: React.ReactNode
   sidebarOpen: boolean
   onToggleSidebar: () => void
-  page: 'research' | 'dashboard'
-  onSelectPage: (page: 'research' | 'dashboard') => void
+  page: 'research' | 'dashboard' | 'eval'
+  onSelectPage: (page: 'research' | 'dashboard' | 'eval') => void
 }
 
 export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectPage }: LayoutProps) {
@@ -48,6 +48,12 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
             label="Dashboard"
             active={page === 'dashboard'}
             onClick={() => onSelectPage('dashboard')}
+          />
+          <NavButton
+            icon={<FlaskConical className="w-4 h-4" />}
+            label="Eval"
+            active={page === 'eval'}
+            onClick={() => onSelectPage('eval')}
           />
           <NavItem icon={<Settings className="w-4 h-4" />} label="Settings" />
         </nav>
