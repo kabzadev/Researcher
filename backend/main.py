@@ -191,38 +191,37 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     d = resp.model_dump() if hasattr(resp, "model_dump") else {}
 
     sources: List[Dict[str, Any]] = []
+    message_text = ""
 
-    # Debug: log output item types and structure
-    for i, item in enumerate(d.get("output") or []):
-        t = item.get("type", "unknown")
+    # First pass: collect sources and message text
+    for item in (d.get("output") or []):
+        t = item.get("type")
         if t == "web_search_call":
             action = item.get("action") or {}
-            src_list = action.get("sources") or []
-            print(f"  [ws-debug] output[{i}] type=web_search_call, action_keys={list(action.keys())}, sources_count={len(src_list)}")
-            if src_list:
-                print(f"  [ws-debug] source[0] keys={list(src_list[0].keys())}")
-            for s in src_list:
+            for s in (action.get("sources") or []):
                 url = s.get("url") or ""
-                if not url:
-                    continue
-                sources.append({
-                    "title": s.get("title") or "",
-                    "url": url,
-                    "content": s.get("snippet") or s.get("text") or "",
-                    "raw_content": s.get("snippet") or s.get("text") or "",
-                })
+                if url:
+                    sources.append({
+                        "title": s.get("title") or "",
+                        "url": url,
+                        "content": "",  # Will populate from fetch or message
+                        "raw_content": "",
+                    })
         elif t == "message":
-            content = item.get("content") or []
-            text_preview = ""
-            for c in content:
+            for c in (item.get("content") or []):
                 if c.get("text"):
-                    text_preview = c["text"][:100]
+                    message_text = c["text"]
                     break
-            print(f"  [ws-debug] output[{i}] type=message, content_items={len(content)}, text_preview={text_preview}")
-        else:
-            print(f"  [ws-debug] output[{i}] type={t}, keys={list(item.keys())}")
 
-    print(f"  [ws-debug] total sources extracted: {len(sources)}")
+    # Populate content: use message text as source content since it summarizes the search results
+    # This is more reliable than fetching each URL
+    if message_text and sources:
+        # Distribute the message text across sources as their content
+        # Each source gets the full message (LLM summary contains info from all sources)
+        for s in sources:
+            s["content"] = message_text[:4000]  # Truncate to avoid token limits
+            s["raw_content"] = message_text[:4000]
+
     return sources[:max_sources]
 
 
