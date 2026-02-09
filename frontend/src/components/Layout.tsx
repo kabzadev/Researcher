@@ -79,6 +79,20 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
           <h1 className="font-semibold text-slate-800">Research Assistant</h1>
           <div className="flex-1" />
           <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  sessionStorage.removeItem('researcher_app_password')
+                  // keep chat history unless you want a full wipe
+                } catch {}
+                window.location.reload()
+              }}
+              className="px-3 py-1 text-sm rounded-full border border-slate-300 text-slate-700 hover:bg-slate-100"
+              title="Clear stored password"
+            >
+              Log out
+            </button>
             <span className="px-3 py-1 bg-primary/10 text-primary text-sm rounded-full">
               Beta
             </span>
