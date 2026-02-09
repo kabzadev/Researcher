@@ -275,16 +275,21 @@ def _is_help_question(q: str) -> bool:
     ql = (q or "").strip().lower()
     if not ql:
         return False
-    triggers = [
-        "help",
-        "/help",
+
+    # Exact / prefix commands
+    if re.match(r"^\s*(/help|help)\b", ql):
+        return True
+
+    # Natural language variants
+    phrases = [
         "what do you do",
         "what can you do",
         "how do i use",
         "capabilities",
         "supported metrics",
+        "what metrics",
     ]
-    return ql in triggers or any(ql.startswith(t) for t in ["help ", "/help "])
+    return any(p in ql for p in phrases)
 
 
 def _help_payload() -> Dict[str, Any]:
