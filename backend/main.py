@@ -1033,7 +1033,11 @@ def research_stream(req: ResearchRequest):
 
             # Pass 1
             if use_openai_search:
-                r1 = openai_web_search(query)
+                try:
+                    r1 = openai_web_search(query)
+                except Exception as e:
+                    print(f"OpenAI web_search error for '{query[:30]}...': {e}")
+                    r1 = []
             else:
                 _run_metric_incr("tavily_searches", 1)
                 sr1 = tavily.search(
@@ -1384,7 +1388,11 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             print(f"Searching: {query[:50]}...")
             local_searches += 1
             if use_openai_search:
-                r1 = openai_web_search(query)
+                try:
+                    r1 = openai_web_search(query)
+                except Exception as e:
+                    print(f"OpenAI web_search error for '{query[:30]}...': {e}")
+                    r1 = []
             else:
                 sr1 = tavily.search(
                     query=query,
@@ -1402,7 +1410,7 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
             # Option A: targeted second-pass when weak
             second_pass_used = False
-            if (not eval_mode) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
+            if (not eval_mode) and (not use_openai_search) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
                 q2 = refine_query(query)
                 if q2 and q2 != query:
                     second_pass_used = True
