@@ -12,7 +12,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -32,6 +32,34 @@ from openai import OpenAI
 from tavily import TavilyClient
 
 app = FastAPI(title="Researcher API", version="0.1.0")
+
+# Simple password gate for the entire app (internal PLC)
+# Client must send: Authorization: Bearer <password>
+APP_PASSWORD = os.getenv("RESEARCHER_APP_PASSWORD")
+
+@app.middleware("http")
+async def password_gate(request: Request, call_next):
+    # Always allow CORS preflight
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # Allow health checks unauthenticated
+    if request.url.path in ("/health",):
+        return await call_next(request)
+
+    # If password not configured, fail closed
+    if not APP_PASSWORD:
+        raise HTTPException(status_code=503, detail="App password not configured")
+
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    token = auth.removeprefix("Bearer ").strip()
+    if token != APP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return await call_next(request)
 
 # Configure Application Insights / Azure Monitor OpenTelemetry (best practice)
 # Uses APPLICATIONINSIGHTS_CONNECTION_STRING from Key Vault.

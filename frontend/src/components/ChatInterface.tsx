@@ -33,6 +33,7 @@ export function ChatInterface() {
   const [isLoading, setIsLoading] = useState(false)
   const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic')
   const [streamingEnabled, setStreamingEnabled] = useState(true)
+  const [appPassword, setAppPassword] = useState<string>(() => sessionStorage.getItem('researcher_app_password') || '')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -131,7 +132,10 @@ export function ChatInterface() {
         // Non-streaming mode (wait for full response)
         const response = await fetch(`${API_URL}/research`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${appPassword}`
+          },
           body: JSON.stringify({ question: input, provider })
         })
 
@@ -146,7 +150,10 @@ export function ChatInterface() {
       // Streaming mode (SSE)
       const response = await fetch(`${API_URL}/research/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${appPassword}`
+        },
         body: JSON.stringify({ question: input, provider })
       })
 
@@ -222,6 +229,38 @@ export function ChatInterface() {
     } finally {
       setIsLoading(false)
     }
+  }
+
+  // Simple app-wide password gate
+  if (!appPassword) {
+    return (
+      <div className="flex flex-col h-full max-w-md mx-auto justify-center p-6">
+        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+          <h2 className="text-lg font-semibold text-slate-900">Researcher Access</h2>
+          <p className="text-sm text-slate-500 mt-1">Enter the app password to continue.</p>
+
+          <div className="mt-4 flex gap-2">
+            <input
+              type="password"
+              value={appPassword}
+              onChange={(e) => setAppPassword(e.target.value)}
+              placeholder="Password"
+              className="flex-1 rounded-xl border border-slate-300 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+            />
+            <button
+              onClick={() => sessionStorage.setItem('researcher_app_password', appPassword)}
+              className="px-4 py-2 bg-primary text-white rounded-xl hover:bg-primary-dark transition-colors"
+            >
+              Enter
+            </button>
+          </div>
+
+          <p className="mt-3 text-[11px] text-slate-400">
+            This app is protected. Credentials are stored only in your browser session.
+          </p>
+        </div>
+      </div>
+    )
   }
 
   return (
