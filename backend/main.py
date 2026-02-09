@@ -226,6 +226,46 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     return sources[:max_sources]
 
 
+@app.get("/debug/web-search")
+async def debug_web_search(q: str = "new look fashion UK 2025", authorization: str = Header(None)):
+    """Debug endpoint to inspect raw OpenAI web_search response structure."""
+    if not authorization or not authorization.replace("Bearer ", "") == os.getenv("RESEARCHER_APP_PASSWORD", ""):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        client = get_openai_client()
+        resp = client.responses.create(
+            model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
+            tools=[{"type": "web_search"}],
+            tool_choice="auto",
+            include=["web_search_call.action.sources"],
+            input=q,
+        )
+        d = resp.model_dump() if hasattr(resp, "model_dump") else {}
+        # Summarize output items
+        summary = []
+        for i, item in enumerate(d.get("output") or []):
+            t = item.get("type", "unknown")
+            entry = {"index": i, "type": t, "keys": list(item.keys())}
+            if t == "web_search_call":
+                action = item.get("action") or {}
+                entry["action_keys"] = list(action.keys())
+                entry["action_type"] = action.get("type")
+                entry["action_status"] = action.get("status")
+                src = action.get("sources") or []
+                entry["sources_count"] = len(src)
+                if src:
+                    entry["source_0"] = src[0]
+            elif t == "message":
+                for c in (item.get("content") or []):
+                    if c.get("text"):
+                        entry["text_preview"] = c["text"][:500]
+                        break
+            summary.append(entry)
+        return {"output_count": len(d.get("output", [])), "items": summary, "model": d.get("model"), "usage": d.get("usage")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Eagerly initialize Tavily at startup to catch config errors early
 try:
     get_tavily_client()
