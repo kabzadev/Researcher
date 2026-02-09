@@ -193,7 +193,7 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     sources: List[Dict[str, Any]] = []
     message_text = ""
 
-    # First pass: collect sources and message text
+    # First pass: collect source URLs and message text
     for item in (d.get("output") or []):
         t = item.get("type")
         if t == "web_search_call":
@@ -204,7 +204,7 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
                     sources.append({
                         "title": s.get("title") or "",
                         "url": url,
-                        "content": "",  # Will populate from fetch or message
+                        "content": "",
                         "raw_content": "",
                     })
         elif t == "message":
@@ -213,14 +213,15 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
                     message_text = c["text"]
                     break
 
-    # Populate content: use message text as source content since it summarizes the search results
-    # This is more reliable than fetching each URL
-    if message_text and sources:
-        # Distribute the message text across sources as their content
-        # Each source gets the full message (LLM summary contains info from all sources)
-        for s in sources:
-            s["content"] = message_text[:4000]  # Truncate to avoid token limits
-            s["raw_content"] = message_text[:4000]
+    # For OpenAI web search, the LLM message IS the analyzed content.
+    # Return it as a single synthetic source with the actual analysis.
+    if message_text:
+        return [{
+            "title": "Web Search Analysis",
+            "url": sources[0]["url"] if sources else "",
+            "content": message_text[:6000],
+            "raw_content": message_text[:6000],
+        }]
 
     return sources[:max_sources]
 
