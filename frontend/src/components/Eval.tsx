@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Play, RefreshCcw } from 'lucide-react'
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+// Keep consistent with other components (production-safe default).
+const API_URL = import.meta.env.VITE_API_URL || 'https://researcher-api.thankfulwave-8ed54622.eastus2.azurecontainerapps.io'
 
 type EvalQuestion = {
   id: string
@@ -25,7 +26,7 @@ type EvalResultRow = {
 }
 
 export function Eval() {
-  const appPassword = useMemo(() => sessionStorage.getItem('researcher_app_password') || '', [])
+  const appPassword = sessionStorage.getItem('researcher_app_password') || ''
 
   const [questions, setQuestions] = useState<EvalQuestion[]>([])
   const [results, setResults] = useState<EvalResultRow[]>([])
