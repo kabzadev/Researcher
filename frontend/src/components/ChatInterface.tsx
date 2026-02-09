@@ -24,13 +24,28 @@ interface Driver {
 }
 
 export function ChatInterface() {
-  const [messages, setMessages] = useState<Message[]>([
+  const defaultWelcome: Message[] = [
     {
       id: '1',
       role: 'assistant',
-      content: 'Hello! I\'m your research assistant. I can help you understand changes in brand metrics by researching external factors.\n\n**Currently supported:** Questions about Salient (mental availability) changes for fashion retail brands.\n\n**Example:** "Salience fell by 6 points in Q3 2025 for new look, can you help find external reasons for decreased mental availability?"'
+      content:
+        'Hello! I\'m your research assistant. I can help you understand changes in brand metrics by researching external factors.\n\n' +
+        '**Currently supported:** Questions about Salient (mental availability) changes for fashion retail brands.\n\n' +
+        '**Example:** "Salience fell by 6 points in Q3 2025 for new look, can you help find external reasons for decreased mental availability?"'
     }
-  ])
+  ]
+
+  const [messages, setMessages] = useState<Message[]>(() => {
+    try {
+      const raw = sessionStorage.getItem('researcher_chat_messages_v1')
+      if (!raw) return defaultWelcome
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed) && parsed.length) return parsed
+      return defaultWelcome
+    } catch {
+      return defaultWelcome
+    }
+  })
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic')
@@ -47,6 +62,15 @@ export function ChatInterface() {
 
   useEffect(() => {
     scrollToBottom()
+  }, [messages])
+
+  // Persist chat history across navigation within the app (session-scoped)
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('researcher_chat_messages_v1', JSON.stringify(messages))
+    } catch {
+      // ignore storage errors
+    }
   }, [messages])
 
   const API_URL = 'https://researcher-api.thankfulwave-8ed54622.eastus2.azurecontainerapps.io'
