@@ -158,6 +158,9 @@ class ResearchResponse(BaseModel):
     validated_hypotheses: Dict[str, List[Dict]]
     summary: Dict[str, List[Dict]]
 
+    # Coaching / clarification
+    coaching: Optional[Dict[str, Any]] = None
+
     # Telemetry
     run_id: Optional[str] = None
     latency_ms: Optional[int] = None
@@ -267,6 +270,29 @@ def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 
         return text
 
     raise HTTPException(status_code=400, detail=f"Unknown provider: {chosen_provider}. Use 'anthropic' or 'openai'.")
+
+def _looks_like_metric_change(q: str) -> bool:
+    ql = (q or "").lower()
+    metric_words = ["salience", "awareness", "consideration", "preference", "intent", "nps", "share of voice"]
+    change_words = ["increased", "decreased", "fell", "rose", "down", "up", "drop", "gain", "change"]
+    return any(w in ql for w in metric_words) and any(w in ql for w in change_words)
+
+
+def _coaching_payload(question: str, brand_hint: str = "") -> Dict[str, Any]:
+    b = brand_hint or "the brand"
+    return {
+        "message": (
+            "Your question is valid, but it doesn’t map cleanly to our current metric-change research pipeline. "
+            "To get the best results, pick a timeframe and define what ‘underperforming’ means (revenue vs market share vs awareness/salience)."
+        ),
+        "suggested_questions": [
+            f"Who are {b}'s biggest competitors globally and in Asia/Europe/US? Provide citations.",
+            f"In 2024–2025, which regions is {b} underperforming in (North America, China, EMEA) based on revenue growth/decline? Provide citations.",
+            f"Brand salience decreased for {b} in China in Q3 2025 — find external reasons with citations.",
+        ],
+        "need": ["timeframe", "definition_of_underperforming"],
+    }
+
 
 # Competitor Database
 COMPETITOR_DB = {
@@ -467,6 +493,28 @@ def research_stream(req: ResearchRequest):
     def event_gen():
         started_at = datetime.now()
         yield sse("status", {"stage": "start", "provider": provider})
+
+        # STRICT coaching mode (stream): coach instead of forcing the pipeline
+        if not _looks_like_metric_change(req.question):
+            brand_guess = "unknown"
+            m = re.search(r"\b([A-Z][A-Za-z0-9&\- ]{1,30})\b", req.question)
+            if m:
+                brand_guess = m.group(1).strip().lower()
+
+            coaching = _coaching_payload(req.question, brand_hint=brand_guess)
+            yield sse("final", {
+                "question": req.question,
+                "brand": brand_guess,
+                "metrics": ["salient"],
+                "direction": "change",
+                "time_period": None,
+                "provider_used": provider,
+                "hypotheses": {"market": [], "brand": [], "competitive": []},
+                "validated_hypotheses": {"market": [], "brand": [], "competitive": []},
+                "summary": {"macro_drivers": [], "brand_drivers": [], "competitive_drivers": []},
+                "coaching": coaching,
+            })
+            return
 
         # Step 1: Parse question
         parsed = parse_question(req.question, provider=provider)

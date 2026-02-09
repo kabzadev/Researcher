@@ -80,6 +80,24 @@ export function ChatInterface() {
 
       // Helper to finalize message from a full JSON payload (used by both modes)
       const buildAssistantFromData = (data: any): Message => {
+        // Coaching / clarification path
+        if (data.coaching) {
+          const suggestions = (data.coaching.suggested_questions || []) as string[]
+          const need = (data.coaching.need || []) as string[]
+          return {
+            id: assistantId,
+            role: 'assistant',
+            provider: data.provider_used || provider,
+            content:
+              `I can answer this, but I need 1–2 details first to avoid guessing.\n\n` +
+              (need.length ? `Missing: ${need.join(', ')}\n\n` : '') +
+              `${data.coaching.message || ''}\n\n` +
+              (suggestions.length
+                ? `Try one of these:\n${suggestions.map((s) => `• ${s}`).join('\n')}`
+                : ''),
+          }
+        }
+
         const hasFindings =
           (data.summary?.macro_drivers?.length || 0) > 0 ||
           (data.summary?.brand_drivers?.length || 0) > 0 ||
