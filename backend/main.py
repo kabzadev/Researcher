@@ -25,6 +25,7 @@ try:
     from azure.monitor.opentelemetry import configure_azure_monitor
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
     from azure.monitor.query import LogsQueryClient
     from azure.identity import DefaultAzureCredential
 except Exception:
@@ -33,6 +34,7 @@ except Exception:
     RequestsInstrumentor = None
     LogsQueryClient = None
     DefaultAzureCredential = None
+    LoggingInstrumentor = None
 from pydantic import BaseModel, Field
 import anthropic
 import openai
@@ -82,9 +84,12 @@ if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING") and configure_azure_monito
         configure_azure_monitor()
         if RequestsInstrumentor:
             RequestsInstrumentor().instrument()
+        if LoggingInstrumentor:
+            # Capture stdlib logging into OpenTelemetry so it lands in AppTraces
+            LoggingInstrumentor().instrument(set_logging_format=True)
         if FastAPIInstrumentor:
             FastAPIInstrumentor.instrument_app(app)
-        print("✓ Application Insights telemetry enabled")
+        print("✓ Application Insights telemetry enabled (traces + logs)")
     except Exception as e:
         print(f"⚠ Failed to enable Application Insights telemetry: {e}")
 
