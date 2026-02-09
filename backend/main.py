@@ -227,10 +227,8 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
 
 
 @app.get("/debug/web-search")
-async def debug_web_search(q: str = "new look fashion UK 2025", authorization: str = Header(None)):
+async def debug_web_search(request: Request, q: str = "new look fashion UK 2025"):
     """Debug endpoint to inspect raw OpenAI web_search response structure."""
-    if not authorization or not authorization.replace("Bearer ", "") == os.getenv("RESEARCHER_APP_PASSWORD", ""):
-        raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         client = get_openai_client()
         resp = client.responses.create(
