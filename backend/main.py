@@ -623,8 +623,23 @@ def research_stream(req: ResearchRequest):
         return f"event: {event}\ndata: {payload}\n\n"
 
     def event_gen():
+        run_id = str(uuid.uuid4())
         started_at = datetime.now()
-        yield sse("status", {"stage": "start", "provider": provider})
+        token = _run_ctx.set(
+            {
+                "run_id": run_id,
+                "provider": provider,
+                "question": req.question,
+                "started_at": started_at.isoformat(),
+                "tavily_searches": 0,
+                "tavily_second_passes": 0,
+                "llm_calls": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+            }
+        )
+
+        yield sse("status", {"stage": "start", "provider": provider, "run_id": run_id})
 
         # Help shortcut (stream)
         if _is_help_question(req.question):
@@ -794,6 +809,34 @@ def research_stream(req: ResearchRequest):
         else:
             metrics_arr = ["salient"]
 
+        ctx = _run_ctx.get() or {}
+        latency_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+
+        tokens_in = int(ctx.get("tokens_in", 0) or 0)
+        tokens_out = int(ctx.get("tokens_out", 0) or 0)
+
+        run_summary = {
+            "run_id": ctx.get("run_id"),
+            "started_at": ctx.get("started_at"),
+            "latency_ms": latency_ms,
+            "provider": provider,
+            "question": req.question,
+            "brand": parsed.get("brand"),
+            "time_period": parsed.get("time_period"),
+            "tavily_searches": int(ctx.get("tavily_searches", 0) or 0),
+            "tavily_second_passes": int(ctx.get("tavily_second_passes", 0) or 0),
+            "llm_calls": int(ctx.get("llm_calls", 0) or 0),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tokens_total": tokens_in + tokens_out,
+            "validated_counts": {
+                "market": len(validated.get("market", []) or []),
+                "brand": len(validated.get("brand", []) or []),
+                "competitive": len(validated.get("competitive", []) or []),
+            },
+        }
+        RUN_LOG.append(run_summary)
+
         resp = {
             "question": req.question,
             "brand": parsed.get("brand"),
@@ -804,9 +847,19 @@ def research_stream(req: ResearchRequest):
             "hypotheses": hypotheses,
             "validated_hypotheses": validated,
             "summary": summary,
-            "latency_ms": int((datetime.now() - started_at).total_seconds() * 1000),
+            "run_id": run_id,
+            "latency_ms": latency_ms,
+            "tavily_searches": run_summary["tavily_searches"],
+            "tavily_second_passes": run_summary["tavily_second_passes"],
+            "llm_calls": run_summary["llm_calls"],
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tokens_total": tokens_in + tokens_out,
         }
         yield sse("final", resp)
+
+        # best-effort clear run context
+        _run_ctx.reset(token)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
