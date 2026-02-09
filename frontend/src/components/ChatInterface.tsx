@@ -275,7 +275,12 @@ export function ChatInterface() {
       const body = m ? (m[2] || '') : ''
 
       if (status === 401) {
-        errorMsg = "⚠️ **Unauthorized (401)**\n\nYour app password wasn’t accepted (or wasn’t sent). Please re-enter it and try again."
+        // If password is wrong/rotated, force re-login instead of trapping the user.
+        try {
+          sessionStorage.removeItem('researcher_app_password')
+        } catch {}
+        setAppPassword('')
+        errorMsg = "⚠️ **Unauthorized (401)**\n\nYour saved app password is no longer valid. I logged you out — please re-enter the password to continue."
       } else if (status === 402) {
         errorMsg = "⚠️ **API Credits Exhausted (402)**\n\nThe selected provider appears to be out of credits. Try switching providers or adding credits."
       } else if (status === 500) {
