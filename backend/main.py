@@ -180,33 +180,58 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     if user_location:
         tools = [{"type": "web_search", "user_location": user_location}]
 
+    search_prompt = (
+        "Use web search. Return a JSON array of up to "
+        + str(max_sources)
+        + " sources for the query. Each item: {title, url, snippet}. Query: "
+        + query
+    )
+
     resp = client.responses.create(
         model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
         tools=tools,
         tool_choice="auto",
         include=["web_search_call.action.sources"],
-        input=query,
-        max_tool_calls=1,
+        input=search_prompt,
+        # NOTE: some SDK versions do not support max_tool_calls; don't pass it.
     )
 
-    # Use model_dump so we don't depend on SDK object shapes.
-    d = resp.model_dump() if hasattr(resp, "model_dump") else resp
+    # Parse assistant output text as JSON.
+    text = None
+    try:
+        text = getattr(resp, "output_text", None)
+    except Exception:
+        text = None
+
+    if not text:
+        d = resp.model_dump() if hasattr(resp, "model_dump") else {}
+        # try to find first message output_text
+        for item in (d.get("output") or []):
+            if item.get("type") == "message":
+                for c in (item.get("content") or []):
+                    if c.get("type") in ("output_text", "text") and c.get("text"):
+                        text = c.get("text")
+                        break
 
     sources: List[Dict[str, Any]] = []
-    for item in (d.get("output") or []):
-        if item.get("type") != "web_search_call":
-            continue
-        action = item.get("action") or {}
-        for s in (action.get("sources") or []):
-            url = s.get("url") or ""
-            if not url:
-                continue
-            sources.append({
-                "title": s.get("title") or "",
-                "url": url,
-                "content": s.get("snippet") or s.get("text") or "",
-                "raw_content": s.get("snippet") or s.get("text") or "",
-            })
+    if text:
+        try:
+            arr = json.loads(text)
+            if isinstance(arr, list):
+                for s in arr:
+                    if not isinstance(s, dict):
+                        continue
+                    url = s.get("url") or ""
+                    if not url:
+                        continue
+                    sources.append({
+                        "title": s.get("title") or "",
+                        "url": url,
+                        "content": s.get("snippet") or "",
+                        "raw_content": s.get("snippet") or "",
+                    })
+        except Exception:
+            sources = []
 
     return sources[:max_sources]
 
