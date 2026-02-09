@@ -4,9 +4,11 @@ interface LayoutProps {
   children: React.ReactNode
   sidebarOpen: boolean
   onToggleSidebar: () => void
+  page: 'research' | 'dashboard'
+  onSelectPage: (page: 'research' | 'dashboard') => void
 }
 
-export function Layout({ children, sidebarOpen, onToggleSidebar }: LayoutProps) {
+export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectPage }: LayoutProps) {
   return (
     <div className="flex h-screen bg-slate-50">
       {/* Left Sidebar */}
@@ -25,8 +27,18 @@ export function Layout({ children, sidebarOpen, onToggleSidebar }: LayoutProps) 
         </div>
 
         <nav className="p-2 flex-1 overflow-y-auto">
-          <NavItem icon={<MessageSquare className="w-4 h-4" />} label="New Research" active />
-          <NavItem icon={<FileText className="w-4 h-4" />} label="History" />
+          <NavButton
+            icon={<MessageSquare className="w-4 h-4" />}
+            label="New Research"
+            active={page === 'research'}
+            onClick={() => onSelectPage('research')}
+          />
+          <NavButton
+            icon={<FileText className="w-4 h-4" />}
+            label="Dashboard"
+            active={page === 'dashboard'}
+            onClick={() => onSelectPage('dashboard')}
+          />
           <NavItem icon={<Settings className="w-4 h-4" />} label="Settings" />
         </nav>
 
@@ -63,6 +75,23 @@ export function Layout({ children, sidebarOpen, onToggleSidebar }: LayoutProps) 
         </main>
       </div>
     </div>
+  )
+}
+
+function NavButton({ icon, label, active = false, onClick }: { icon: React.ReactNode; label: string; active?: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
+        active
+          ? 'bg-primary/10 text-primary font-medium'
+          : 'text-slate-600 hover:bg-slate-100'
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
   )
 }
 

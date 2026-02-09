@@ -7,9 +7,13 @@ Uses Tavily for web search
 import os
 import json
 import re
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Deque
 from datetime import datetime
 from dataclasses import dataclass
+from collections import deque
+import uuid
+import time
+import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException, Request
@@ -154,39 +158,115 @@ class ResearchResponse(BaseModel):
     validated_hypotheses: Dict[str, List[Dict]]
     summary: Dict[str, List[Dict]]
 
+    # Telemetry
+    run_id: Optional[str] = None
+    latency_ms: Optional[int] = None
+    tavily_searches: Optional[int] = None
+    tavily_second_passes: Optional[int] = None
+    llm_calls: Optional[int] = None
+    tokens_in: Optional[int] = None
+    tokens_out: Optional[int] = None
+    tokens_total: Optional[int] = None
+
+# --------------------
+# Telemetry (in-memory ring buffer + per-request context)
+# --------------------
+
+_run_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("run_ctx", default=None)
+RUN_LOG: Deque[dict] = deque(maxlen=500)
+
+
+def _run_metric_incr(key: str, amount: int = 1):
+    ctx = _run_ctx.get()
+    if not ctx:
+        return
+    ctx[key] = int(ctx.get(key, 0) or 0) + amount
+
+
+def _run_metric_set(key: str, value: Any):
+    ctx = _run_ctx.get()
+    if not ctx:
+        return
+    ctx[key] = value
+
+
+def _run_llm_record(call: dict):
+    ctx = _run_ctx.get()
+    if not ctx:
+        return
+    calls = ctx.setdefault("llm_call_details", [])
+    calls.append(call)
+
+
 # LLM Abstraction Layer
 def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 1000) -> str:
-    """Generate text using the specified LLM provider"""
-    
-    # Determine which provider to use
+    """Generate text using the specified LLM provider.
+
+    Also records per-call telemetry into the current run context (if present).
+    """
+
     chosen_provider = provider or DEFAULT_PROVIDER
-    
+    started = time.time()
+
     if chosen_provider == "anthropic":
         client = get_anthropic_client()
-        if not client:
-            raise HTTPException(status_code=503, detail="Anthropic API key not configured")
-        
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
-        return response.content[0].text
-    
-    elif chosen_provider == "openai":
+        text = response.content[0].text
+        usage_obj = getattr(response, "usage", None)
+        in_toks = int(getattr(usage_obj, "input_tokens", 0) or 0)
+        out_toks = int(getattr(usage_obj, "output_tokens", 0) or 0)
+
+        _run_metric_incr("llm_calls", 1)
+        _run_metric_incr("tokens_in", in_toks)
+        _run_metric_incr("tokens_out", out_toks)
+        _run_llm_record(
+            {
+                "provider": "anthropic",
+                "model": ANTHROPIC_MODEL,
+                "latency_ms": int((time.time() - started) * 1000),
+                "max_tokens": max_tokens,
+                "tokens_in": in_toks,
+                "tokens_out": out_toks,
+                "prompt_chars": len(prompt or ""),
+                "output_chars": len(text or ""),
+            }
+        )
+        return text
+
+    if chosen_provider == "openai":
         client = get_openai_client()
-        if not client:
-            raise HTTPException(status_code=503, detail="OpenAI API key not configured")
-        
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content or ""
-    
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown provider: {chosen_provider}. Use 'anthropic' or 'openai'.")
+        text = response.choices[0].message.content or ""
+        usage_obj = getattr(response, "usage", None)
+        in_toks = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+        out_toks = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+
+        _run_metric_incr("llm_calls", 1)
+        _run_metric_incr("tokens_in", in_toks)
+        _run_metric_incr("tokens_out", out_toks)
+        _run_llm_record(
+            {
+                "provider": "openai",
+                "model": OPENAI_MODEL,
+                "latency_ms": int((time.time() - started) * 1000),
+                "max_tokens": max_tokens,
+                "tokens_in": in_toks,
+                "tokens_out": out_toks,
+                "prompt_chars": len(prompt or ""),
+                "output_chars": len(text or ""),
+            }
+        )
+        return text
+
+    raise HTTPException(status_code=400, detail=f"Unknown provider: {chosen_provider}. Use 'anthropic' or 'openai'.")
 
 # Competitor Database
 COMPETITOR_DB = {
@@ -199,13 +279,80 @@ COMPETITOR_DB = {
 def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
+
+@app.get("/telemetry/runs")
+def telemetry_runs(limit: int = 50):
+    """Return recent run summaries (in-memory ring buffer).
+
+    This is an MVP to power the in-app dashboard without introducing a DB.
+    """
+    lim = max(1, min(int(limit or 50), 200))
+    items = list(RUN_LOG)[-lim:]
+    return {"runs": items}
+
+
+@app.get("/telemetry/summary")
+def telemetry_summary():
+    items = list(RUN_LOG)
+    if not items:
+        return {
+            "runs": 0,
+            "errors": 0,
+            "p50_latency_ms": None,
+            "p95_latency_ms": None,
+            "tokens_total": 0,
+            "tavily_searches": 0,
+            "tavily_second_passes": 0,
+            "providers": {},
+        }
+
+    latencies = sorted([int(i.get("latency_ms", 0) or 0) for i in items if i.get("latency_ms") is not None])
+    def pct(p: float):
+        if not latencies:
+            return None
+        idx = int(round((p/100.0) * (len(latencies)-1)))
+        return latencies[max(0, min(idx, len(latencies)-1))]
+
+    providers = {}
+    for i in items:
+        pr = i.get("provider") or "unknown"
+        providers[pr] = providers.get(pr, 0) + 1
+
+    return {
+        "runs": len(items),
+        "errors": len([i for i in items if i.get("error")]),
+        "p50_latency_ms": pct(50),
+        "p95_latency_ms": pct(95),
+        "tokens_total": sum(int(i.get("tokens_total", 0) or 0) for i in items),
+        "tavily_searches": sum(int(i.get("tavily_searches", 0) or 0) for i in items),
+        "tavily_second_passes": sum(int(i.get("tavily_second_passes", 0) or 0) for i in items),
+        "providers": providers,
+    }
+
 @app.post("/research")
 def research(req: ResearchRequest):
     """Main research endpoint - hypothesis-driven analysis"""
-    
+
+    run_id = str(uuid.uuid4())
+    started_at = time.time()
+
     # Determine which provider to use (request param > env var > default)
     provider = req.provider or DEFAULT_PROVIDER
-    
+
+    token = _run_ctx.set(
+        {
+            "run_id": run_id,
+            "provider": provider,
+            "question": req.question,
+            "started_at": datetime.now().isoformat(),
+            "tavily_searches": 0,
+            "tavily_second_passes": 0,
+            "llm_calls": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+        }
+    )
+
     try:
         # Step 1: Parse question
         parsed = parse_question(req.question, provider=provider)
@@ -231,6 +378,38 @@ def research(req: ResearchRequest):
         else:
             metrics_arr = ["salient"]
         
+        ctx = _run_ctx.get() or {}
+        latency_ms = int((time.time() - started_at) * 1000)
+        _run_metric_set("latency_ms", latency_ms)
+        _run_metric_set("brand", parsed.get("brand"))
+        _run_metric_set("time_period", parsed.get("time_period"))
+
+        # finalize totals
+        tokens_in = int(ctx.get("tokens_in", 0) or 0)
+        tokens_out = int(ctx.get("tokens_out", 0) or 0)
+
+        run_summary = {
+            "run_id": ctx.get("run_id"),
+            "started_at": ctx.get("started_at"),
+            "latency_ms": latency_ms,
+            "provider": provider,
+            "question": req.question,
+            "brand": parsed.get("brand"),
+            "time_period": parsed.get("time_period"),
+            "tavily_searches": int(ctx.get("tavily_searches", 0) or 0),
+            "tavily_second_passes": int(ctx.get("tavily_second_passes", 0) or 0),
+            "llm_calls": int(ctx.get("llm_calls", 0) or 0),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tokens_total": tokens_in + tokens_out,
+            "validated_counts": {
+                "market": len(validated.get("market", []) or []),
+                "brand": len(validated.get("brand", []) or []),
+                "competitive": len(validated.get("competitive", []) or []),
+            },
+        }
+        RUN_LOG.append(run_summary)
+
         return ResearchResponse(
             question=req.question,
             brand=parsed.get("brand") or "unknown",
@@ -240,7 +419,15 @@ def research(req: ResearchRequest):
             provider_used=provider,
             hypotheses=hypotheses,
             validated_hypotheses=validated,
-            summary=summary
+            summary=summary,
+            run_id=run_id,
+            latency_ms=latency_ms,
+            tavily_searches=run_summary["tavily_searches"],
+            tavily_second_passes=run_summary["tavily_second_passes"],
+            llm_calls=run_summary["llm_calls"],
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            tokens_total=tokens_in + tokens_out,
         )
     except anthropic.BadRequestError as e:
         error_msg = str(e)
@@ -260,6 +447,9 @@ def research(req: ResearchRequest):
         raise HTTPException(status_code=400, detail=f"OpenAI model error: {error_msg}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Research error: {str(e)}")
+    finally:
+        # clear run context
+        _run_ctx.reset(token)
 
 @app.post("/research/stream")
 def research_stream(req: ResearchRequest):
@@ -312,6 +502,7 @@ def research_stream(req: ResearchRequest):
                 return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
 
             # Pass 1
+            _run_metric_incr("tavily_searches", 1)
             sr1 = tavily.search(
                 query=query,
                 search_depth="basic",
@@ -331,6 +522,8 @@ def research_stream(req: ResearchRequest):
                 if q2 and q2 != query:
                     second_pass_used = True
                     second_query = q2
+                    _run_metric_incr("tavily_searches", 1)
+                    _run_metric_incr("tavily_second_passes", 1)
                     sr2 = tavily.search(
                         query=q2,
                         search_depth="basic",
@@ -594,6 +787,7 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
         try:
             # Pass 1
             print(f"Searching: {query[:50]}...")
+            _run_metric_incr("tavily_searches", 1)
             sr1 = tavily.search(
                 query=query,
                 search_depth="basic",
@@ -615,6 +809,8 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
                 if q2 and q2 != query:
                     second_pass_used = True
                     print(f"2nd-pass search: {q2[:60]}...")
+                    _run_metric_incr("tavily_searches", 1)
+                    _run_metric_incr("tavily_second_passes", 1)
                     sr2 = tavily.search(
                         query=q2,
                         search_depth="basic",
