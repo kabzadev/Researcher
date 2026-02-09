@@ -210,6 +210,7 @@ class ResearchResponse(BaseModel):
 # --------------------
 
 _run_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("run_ctx", default=None)
+_eval_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("eval_mode", default=False)
 RUN_LOG: Deque[dict] = deque(maxlen=500)
 
 
@@ -596,7 +597,11 @@ def eval_run(payload: dict = Body(...)):
 
         for prov in [providerA, providerB]:
             # call our own research function directly (no HTTP)
-            resp_model = research(ResearchRequest(question=qtext, provider=prov))
+            token_eval = _eval_mode.set(True)
+            try:
+                resp_model = research(ResearchRequest(question=qtext, provider=prov))
+            finally:
+                _eval_mode.reset(token_eval)
             resp = resp_model.model_dump() if hasattr(resp_model, "model_dump") else dict(resp_model)
 
             score = _score_response(resp)
@@ -1247,6 +1252,15 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
     Implements a targeted second-pass search (Option A) when the first pass is weak.
     """
 
+    eval_mode = bool(_eval_mode.get() or False)
+    if eval_mode:
+        # Cheaper/faster settings for eval runs to avoid burning tokens/time.
+        hypotheses = {
+            "market": (hypotheses.get("market") or [])[:2],
+            "brand": (hypotheses.get("brand") or [])[:2],
+            "competitive": (hypotheses.get("competitive") or [])[:2],
+        }
+
     results = {"market": [], "brand": [], "competitive": []}
     errors = []
 
@@ -1284,10 +1298,10 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             sr1 = tavily.search(
                 query=query,
                 search_depth="basic",
-                max_results=3,
-                include_raw_content=True,
+                max_results=2 if eval_mode else 3,
+                include_raw_content=False if eval_mode else True,
             )
-            r1 = sr1.get("results", []) or []
+            r1 = (sr1 or {}).get("results", []) or []
             print(f"Found {len(r1)} results for: {query[:30]}...")
 
             validation = {"validated": False, "evidence": ""}
@@ -1297,7 +1311,7 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
             # Option A: targeted second-pass when weak
             second_pass_used = False
-            if (not r1) or (len(r1) < 2) or (not validation.get("validated")):
+            if (not eval_mode) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
                 q2 = refine_query(query)
                 if q2 and q2 != query:
                     second_pass_used = True
