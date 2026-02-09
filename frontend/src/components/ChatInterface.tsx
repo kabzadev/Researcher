@@ -165,7 +165,10 @@ export function ChatInterface() {
           body: JSON.stringify({ question: input, provider })
         })
 
-        if (!response.ok) throw new Error(`API error: ${response.status}`)
+        if (!response.ok) {
+          const txt = await response.text()
+          throw new Error(`HTTP ${response.status}: ${txt}`)
+        }
 
         const data = await response.json()
         const finalMsg = buildAssistantFromData(data)
@@ -183,7 +186,10 @@ export function ChatInterface() {
         body: JSON.stringify({ question: input, provider })
       })
 
-      if (!response.ok) throw new Error(`API error: ${response.status}`)
+      if (!response.ok) {
+        const txt = await response.text()
+        throw new Error(`HTTP ${response.status}: ${txt}`)
+      }
       if (!response.body) throw new Error('Streaming not supported by browser')
 
       const decoder = new TextDecoder()
@@ -237,21 +243,27 @@ export function ChatInterface() {
         }
       }
     } catch (error: any) {
+      const raw = (error?.message || '').toString()
       let errorMsg = "Sorry, there was an error processing your request."
-      
-      if (error.response?.status === 402) {
-        errorMsg = "⚠️ **API Credits Exhausted**\n\nThe Anthropic API key has no remaining credits. Please add credits at:\nhttps://console.anthropic.com/settings/plans\n\nAlternatively, we can switch to OpenAI if you have credits there."
-      } else if (error.response?.status === 500) {
-        errorMsg = "⚠️ **Server Error**\n\nThe research service encountered an error. Please try again in a moment."
-      } else if (error.message?.includes('CORS')) {
+
+      const m = raw.match(/HTTP\s+(\d+):\s*(.*)/s)
+      const status = m ? parseInt(m[1], 10) : null
+      const body = m ? (m[2] || '') : ''
+
+      if (status === 401) {
+        errorMsg = "⚠️ **Unauthorized (401)**\n\nYour app password wasn’t accepted (or wasn’t sent). Please re-enter it and try again."
+      } else if (status === 402) {
+        errorMsg = "⚠️ **API Credits Exhausted (402)**\n\nThe selected provider appears to be out of credits. Try switching providers or adding credits."
+      } else if (status === 500) {
+        errorMsg = "⚠️ **Server Error (500)**\n\nThe research service threw an error. I’m checking logs now — try again in ~15s."
+      } else if (raw.includes('CORS')) {
         errorMsg = "⚠️ **Connection Error**\n\nCannot connect to the research API. The service may be starting up (cold start takes ~30 seconds). Please try again."
+      } else if (status) {
+        errorMsg = `⚠️ **Request Failed (${status})**\n\n${body || raw}`
       }
-      
-      setMessages(prev => [...prev, {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: errorMsg
-      }])
+
+      // replace placeholder assistant message with the error
+      setMessages(prev => prev.map(m => (m.id === assistantId ? { ...m, content: errorMsg } : m)))
     } finally {
       setIsLoading(false)
     }
