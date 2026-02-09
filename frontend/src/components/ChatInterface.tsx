@@ -186,7 +186,7 @@ export function ChatInterface() {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${appPassword}`
           },
-          body: JSON.stringify({ question: input, provider })
+          body: JSON.stringify({ question: input, provider, search_backend: provider === 'openai' ? 'openai' : 'tavily' })
         })
 
         if (!response.ok) {
@@ -207,7 +207,7 @@ export function ChatInterface() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${appPassword}`
         },
-        body: JSON.stringify({ question: input, provider })
+        body: JSON.stringify({ question: input, provider, search_backend: provider === 'openai' ? 'openai' : 'tavily' })
       })
 
       if (!response.ok) {

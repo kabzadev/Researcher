@@ -164,6 +164,54 @@ def get_tavily_client():
         tavily_client = TavilyClient(api_key=api_key)
     return tavily_client
 
+
+def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_sources: int = 6) -> List[Dict[str, Any]]:
+    """Use OpenAI Responses API web_search tool to retrieve web sources.
+
+    Returns a list of dicts compatible with our existing pipeline:
+      {"title": str, "url": str, "content": str, "raw_content": str}
+
+    Note: This is only enabled when provider=='openai' and request.search_backend=='openai'.
+    """
+
+    client = get_openai_client()
+
+    tools: List[Dict[str, Any]] = [{"type": "web_search"}]
+    if user_location:
+        tools = [{"type": "web_search", "user_location": user_location}]
+
+    resp = client.responses.create(
+        model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
+        tools=tools,
+        tool_choice="auto",
+        include=["web_search_call.action.sources"],
+        input=query,
+        max_tool_calls=1,
+    )
+
+    # Try to harvest sources from web_search_call.action.sources
+    sources: List[Dict[str, Any]] = []
+    try:
+        for item in (getattr(resp, "output", None) or []):
+            if getattr(item, "type", None) == "web_search_call":
+                action = getattr(item, "action", None)
+                if action and getattr(action, "sources", None):
+                    for s in action.sources:
+                        sources.append({
+                            "title": getattr(s, "title", None) or "",
+                            "url": getattr(s, "url", None) or "",
+                            "content": "",
+                            "raw_content": "",
+                        })
+    except Exception:
+        sources = []
+
+    # Fallback: return empty list if sources aren't present.
+    # The validator will then fail closed.
+    out = [s for s in sources if s.get("url")]
+    return out[:max_sources]
+
+
 # Eagerly initialize Tavily at startup to catch config errors early
 try:
     get_tavily_client()
@@ -180,6 +228,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 class ResearchRequest(BaseModel):
     question: str
     provider: Optional[str] = Field(default=None, description="LLM provider: 'anthropic' or 'openai'. Uses DEFAULT_LLM_PROVIDER env var if not specified.")
+    # Search backend is only honored when provider=='openai' (per product decision).
+    search_backend: Optional[str] = Field(default=None, description="Web search backend. For provider=openai: 'tavily' (default) or 'openai' (Responses web_search). Ignored for anthropic.")
 
 class ResearchResponse(BaseModel):
     question: str
@@ -646,6 +696,7 @@ def research(req: ResearchRequest):
             "run_id": run_id,
             "provider": provider,
             "question": req.question,
+            "search_backend": req.search_backend or "tavily",
             "started_at": datetime.now().isoformat(),
             "tavily_searches": 0,
             "tavily_second_passes": 0,
@@ -934,7 +985,9 @@ def research_stream(req: ResearchRequest):
         yield sse("hypotheses", hypotheses)
 
         # Step 4: Process hypotheses in parallel and stream results
-        tavily = get_tavily_client()
+        search_backend = (req.search_backend or "tavily").lower()
+        use_openai_search = (provider == "openai" and search_backend == "openai")
+        tavily = None if use_openai_search else get_tavily_client()
         tasks: List[tuple[Dict, str]] = []
         for cat in ["market", "brand", "competitive"]:
             for hyp in hypotheses.get(cat, []) or []:
@@ -955,14 +1008,17 @@ def research_stream(req: ResearchRequest):
                 return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
 
             # Pass 1
-            _run_metric_incr("tavily_searches", 1)
-            sr1 = tavily.search(
-                query=query,
-                search_depth="basic",
-                max_results=3,
-                include_raw_content=True,
-            )
-            r1 = sr1.get("results", []) or []
+            if use_openai_search:
+                r1 = openai_web_search(query)
+            else:
+                _run_metric_incr("tavily_searches", 1)
+                sr1 = tavily.search(
+                    query=query,
+                    search_depth="basic",
+                    max_results=3,
+                    include_raw_content=True,
+                )
+                r1 = sr1.get("results", []) or []
             validation = {"validated": False, "evidence": ""}
             if r1:
                 validation = validate_hypothesis(hyp, r1, provider=provider)
@@ -970,7 +1026,7 @@ def research_stream(req: ResearchRequest):
             # Option A second pass when weak
             second_pass_used = False
             second_query = None
-            if (not r1) or (len(r1) < 2) or (not validation.get("validated")):
+            if (not use_openai_search) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
                 q2 = refine_query(query)
                 if q2 and q2 != query:
                     second_pass_used = True
@@ -1253,6 +1309,9 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
     """
 
     eval_mode = bool(_eval_mode.get() or False)
+    ctx = _run_ctx.get() or {}
+    search_backend = (ctx.get("search_backend") or "tavily").lower()
+
     if eval_mode:
         # Cheaper/faster settings for eval runs to avoid burning tokens/time.
         hypotheses = {
@@ -1274,7 +1333,10 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
     print(f"Processing {len(all_tasks)} hypotheses...")
 
-    tavily = get_tavily_client()
+    tavily = None
+    use_openai_search = (provider == "openai" and search_backend == "openai")
+    if not use_openai_search:
+        tavily = get_tavily_client()
 
     def refine_query(original: str) -> str:
         # Cheap, deterministic refinement (no extra LLM calls)
@@ -1295,13 +1357,16 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             # Pass 1
             print(f"Searching: {query[:50]}...")
             local_searches += 1
-            sr1 = tavily.search(
-                query=query,
-                search_depth="basic",
-                max_results=2 if eval_mode else 3,
-                include_raw_content=False if eval_mode else True,
-            )
-            r1 = (sr1 or {}).get("results", []) or []
+            if use_openai_search:
+                r1 = openai_web_search(query)
+            else:
+                sr1 = tavily.search(
+                    query=query,
+                    search_depth="basic",
+                    max_results=2 if eval_mode else 3,
+                    include_raw_content=False if eval_mode else True,
+                )
+                r1 = (sr1 or {}).get("results", []) or []
             print(f"Found {len(r1)} results for: {query[:30]}...")
 
             validation = {"validated": False, "evidence": ""}
