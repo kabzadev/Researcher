@@ -10,11 +10,21 @@ interface LayoutProps {
 
 export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectPage }: LayoutProps) {
   return (
-    <div className="flex h-screen bg-slate-50">
+    <div className="flex min-h-dvh h-dvh bg-slate-50 overflow-hidden">
+      {/* Mobile overlay */}
+      {sidebarOpen && (
+        <button
+          type="button"
+          aria-label="Close sidebar"
+          onClick={onToggleSidebar}
+          className="md:hidden fixed inset-0 z-30 bg-black/30"
+        />
+      )}
+
       {/* Left Sidebar */}
       <aside
-        className={`bg-white border-r border-slate-200 transition-all duration-300 flex flex-col ${
-          sidebarOpen ? 'w-64' : 'w-0 overflow-hidden'
+        className={`bg-white border-r border-slate-200 transition-transform duration-200 flex flex-col fixed md:static inset-y-0 left-0 z-40 w-64 ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
         }`}
       >
         <div className="p-4 border-b border-slate-200 flex-shrink-0">
@@ -51,7 +61,7 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
       </aside>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 md:ml-0 ml-0">
         {/* Header */}
         <header className="bg-white border-b border-slate-200 px-4 py-3 flex items-center gap-3">
           <button
