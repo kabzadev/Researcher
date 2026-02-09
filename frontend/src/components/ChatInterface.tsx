@@ -64,6 +64,8 @@ export function ChatInterface() {
     setInput('')
     setIsLoading(true)
 
+    const assistantId = (Date.now() + 1).toString()
+
     try {
       const extractHostname = (url: string): string => {
         try {
@@ -79,8 +81,6 @@ export function ChatInterface() {
         url: d.source_urls?.[0] || d.source || d.url || '',
         source: d.source_title || (d.source_urls?.[0] ? extractHostname(d.source_urls[0]) : d.source ? extractHostname(d.source) : 'Source')
       })
-
-      const assistantId = (Date.now() + 1).toString()
 
       // Helper to finalize message from a full JSON payload (used by both modes)
       const buildAssistantFromData = (data: any): Message => {
