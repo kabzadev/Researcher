@@ -36,7 +36,7 @@ export function Dashboard() {
   const [runs, setRuns] = useState<Run[]>([])
   const [loading, setLoading] = useState(false)
 
-  const token = useMemo(() => sessionStorage.getItem('researcher_app_password') || '', [])
+  const token = sessionStorage.getItem('researcher_app_password') || ''
 
   const headers = useMemo(() => ({
     'Authorization': `Bearer ${token}`

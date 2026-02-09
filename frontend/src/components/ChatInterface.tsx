@@ -34,6 +34,7 @@ export function ChatInterface() {
   const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic')
   const [streamingEnabled, setStreamingEnabled] = useState(true)
   const [appPassword, setAppPassword] = useState<string>(() => sessionStorage.getItem('researcher_app_password') || '')
+  const [passwordInput, setPasswordInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const scrollToBottom = () => {
@@ -233,6 +234,13 @@ export function ChatInterface() {
 
   // Simple app-wide password gate
   if (!appPassword) {
+    const submitPassword = () => {
+      const v = passwordInput.trim()
+      if (!v) return
+      sessionStorage.setItem('researcher_app_password', v)
+      setAppPassword(v)
+    }
+
     return (
       <div className="flex flex-col h-full max-w-md mx-auto justify-center p-6">
         <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
@@ -242,13 +250,17 @@ export function ChatInterface() {
           <div className="mt-4 flex gap-2">
             <input
               type="password"
-              value={appPassword}
-              onChange={(e) => setAppPassword(e.target.value)}
+              value={passwordInput}
+              onChange={(e) => setPasswordInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') submitPassword()
+              }}
               placeholder="Password"
               className="flex-1 rounded-xl border border-slate-300 px-4 py-3 focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
             />
             <button
-              onClick={() => sessionStorage.setItem('researcher_app_password', appPassword)}
+              type="button"
+              onClick={submitPassword}
               className="px-4 py-2 bg-primary text-white rounded-xl hover:bg-primary-dark transition-colors"
             >
               Enter
