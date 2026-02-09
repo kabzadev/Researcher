@@ -25,10 +25,14 @@ try:
     from azure.monitor.opentelemetry import configure_azure_monitor
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    from azure.monitor.query import LogsQueryClient
+    from azure.identity import DefaultAzureCredential
 except Exception:
     configure_azure_monitor = None
     FastAPIInstrumentor = None
     RequestsInstrumentor = None
+    LogsQueryClient = None
+    DefaultAzureCredential = None
 from pydantic import BaseModel, Field
 import anthropic
 import openai
@@ -83,6 +87,31 @@ if os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING") and configure_azure_monito
         print("✓ Application Insights telemetry enabled")
     except Exception as e:
         print(f"⚠ Failed to enable Application Insights telemetry: {e}")
+
+# Logger for durable run summaries (exported to App Insights)
+import logging
+telemetry_logger = logging.getLogger("researcher.telemetry")
+telemetry_logger.setLevel(logging.INFO)
+
+def _emit_run_event(run_summary: Dict[str, Any]):
+    """Emit a durable run summary into App Insights via logs.
+
+    In workspace-based App Insights this lands in AppTraces and is queryable.
+    """
+    try:
+        telemetry_logger.info("ResearchRunSummary %s", json.dumps(run_summary, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _logs_client():
+    if not LogsQueryClient or not DefaultAzureCredential:
+        return None
+    ws = os.getenv("LOG_ANALYTICS_WORKSPACE_ID")
+    if not ws:
+        return None
+    return LogsQueryClient(DefaultAzureCredential()), ws
+
 
 # CORS for frontend - explicitly allow the static web app
 app.add_middleware(
@@ -346,17 +375,74 @@ def health_check():
 
 @app.get("/telemetry/runs")
 def telemetry_runs(limit: int = 50):
-    """Return recent run summaries (in-memory ring buffer).
+    """Return recent run summaries.
 
-    This is an MVP to power the in-app dashboard without introducing a DB.
+    Option 2 (durable): Query workspace-based Application Insights (Log Analytics).
+    Fallback: in-memory ring buffer if query client isn't available.
     """
     lim = max(1, min(int(limit or 50), 200))
+
+    lc = _logs_client()
+    if lc:
+        client, ws = lc
+        query = f"""
+AppTraces
+| where Message startswith 'ResearchRunSummary '
+| extend payload = substring(Message, strlen('ResearchRunSummary '))
+| extend run = parse_json(payload)
+| project run
+| take {lim}
+"""
+        try:
+            resp = client.query_workspace(ws, query)
+            rows = []
+            if resp and resp.tables:
+                for r in resp.tables[0].rows:
+                    rows.append(r[0])
+            # rows are dict-like already
+            return {"runs": rows}
+        except Exception:
+            pass
+
     items = list(RUN_LOG)[-lim:]
     return {"runs": items}
 
 
 @app.get("/telemetry/summary")
 def telemetry_summary():
+    # Try durable query first
+    lc = _logs_client()
+    if lc:
+        client, ws = lc
+        query = """
+AppTraces
+| where Message startswith 'ResearchRunSummary '
+| extend payload = substring(Message, strlen('ResearchRunSummary '))
+| extend run = parse_json(payload)
+| summarize
+    runs=count(),
+    tokens_total=sum(tolong(run.tokens_total)),
+    tavily_searches=sum(tolong(run.tavily_searches)),
+    tavily_second_passes=sum(tolong(run.tavily_second_passes))
+"""
+        try:
+            resp = client.query_workspace(ws, query)
+            if resp and resp.tables and resp.tables[0].rows:
+                r = resp.tables[0].rows[0]
+                return {
+                    "runs": int(r[0] or 0),
+                    "errors": 0,
+                    "p50_latency_ms": None,
+                    "p95_latency_ms": None,
+                    "tokens_total": int(r[1] or 0),
+                    "tavily_searches": int(r[2] or 0),
+                    "tavily_second_passes": int(r[3] or 0),
+                    "providers": {},
+                }
+        except Exception:
+            pass
+
+    # Fallback: in-memory
     items = list(RUN_LOG)
     if not items:
         return {
@@ -371,11 +457,12 @@ def telemetry_summary():
         }
 
     latencies = sorted([int(i.get("latency_ms", 0) or 0) for i in items if i.get("latency_ms") is not None])
+
     def pct(p: float):
         if not latencies:
             return None
-        idx = int(round((p/100.0) * (len(latencies)-1)))
-        return latencies[max(0, min(idx, len(latencies)-1))]
+        idx = int(round((p / 100.0) * (len(latencies) - 1)))
+        return latencies[max(0, min(idx, len(latencies) - 1))]
 
     providers = {}
     for i in items:
@@ -490,6 +577,7 @@ def research(req: ResearchRequest):
                 "coached": True,
             }
             RUN_LOG.append(run_summary)
+            _emit_run_event(run_summary)
 
             return ResearchResponse(
                 question=req.question,
@@ -567,6 +655,7 @@ def research(req: ResearchRequest):
             },
         }
         RUN_LOG.append(run_summary)
+        _emit_run_event(run_summary)
 
         return ResearchResponse(
             question=req.question,
@@ -836,6 +925,7 @@ def research_stream(req: ResearchRequest):
             },
         }
         RUN_LOG.append(run_summary)
+        _emit_run_event(run_summary)
 
         resp = {
             "question": req.question,
