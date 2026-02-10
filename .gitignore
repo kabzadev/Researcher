@@ -32,3 +32,6 @@ Thumbs.db
 # Secrets
 *.key
 *.pem
+
+# Azure SWA deployment artifacts
+*.zip
