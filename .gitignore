@@ -35,3 +35,18 @@ Thumbs.db
 
 # Azure SWA deployment artifacts
 *.zip
+*.tgz
+
+# Node.js
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+frontend/dist/
+dist/
+build/
