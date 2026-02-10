@@ -60,8 +60,14 @@ export function ChatInterface() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
 
+  // Track last message count to only scroll on new messages, not feedback updates
+  const lastMessageCountRef = useRef(messages.length)
   useEffect(() => {
-    scrollToBottom()
+    // Only scroll if we added a new message (not just updating feedback)
+    if (messages.length > lastMessageCountRef.current) {
+      scrollToBottom()
+      lastMessageCountRef.current = messages.length
+    }
   }, [messages])
 
   // Persist chat history across navigation within the app (session-scoped)
@@ -377,22 +383,28 @@ export function ChatInterface() {
                   <button
                     type="button"
                     className={`px-2 py-1 rounded-lg border ${message.feedback === 1 ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-white border-slate-200 hover:bg-slate-50'}`}
-                    onClick={async () => {
+                    onClick={async (e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
                       // optimistic UI
                       setMessages(prev => prev.map(m => m.id === message.id ? { ...m, feedback: 1 } : m))
-                      await fetch(`${API_URL}/feedback`, {
-                        method: 'POST',
-                        headers: {
-                          'Content-Type': 'application/json',
-                          'Authorization': `Bearer ${appPassword}`
-                        },
-                        body: JSON.stringify({
-                          run_id: message.runId,
-                          rating: 1,
-                          provider: message.provider,
-                          question: messages.find(m => m.role === 'user')?.content
+                      try {
+                        await fetch(`${API_URL}/feedback`, {
+                          method: 'POST',
+                          headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${appPassword}`
+                          },
+                          body: JSON.stringify({
+                            run_id: message.runId,
+                            rating: 1,
+                            provider: message.provider,
+                            question: messages.find(m => m.role === 'user')?.content
+                          })
                         })
-                      })
+                      } catch (err) {
+                        console.error('Feedback error:', err)
+                      }
                     }}
                   >
                     👍
@@ -551,20 +563,24 @@ export function ChatInterface() {
                   if (feedbackModal.messageId) {
                     setMessages(prev => prev.map(m => m.id === feedbackModal.messageId ? { ...m, feedback: -1 } : m))
                   }
-                  await fetch(`${API_URL}/feedback`, {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'Authorization': `Bearer ${appPassword}`
-                    },
-                    body: JSON.stringify({
-                      run_id: runId,
-                      rating: -1,
-                      comment: feedbackText,
-                      provider: feedbackModal.provider,
-                      question: feedbackModal.question
+                  try {
+                    await fetch(`${API_URL}/feedback`, {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${appPassword}`
+                      },
+                      body: JSON.stringify({
+                        run_id: runId,
+                        rating: -1,
+                        comment: feedbackText,
+                        provider: feedbackModal.provider,
+                        question: feedbackModal.question
+                      })
                     })
-                  })
+                  } catch (err) {
+                    console.error('Feedback error:', err)
+                  }
                   setFeedbackModal({ open: false })
                 }}
               >
