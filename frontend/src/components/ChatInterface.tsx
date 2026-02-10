@@ -48,7 +48,7 @@ export function ChatInterface() {
   })
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic')
+  const [provider] = useState<'anthropic' | 'openai'>('openai')
   const [streamingEnabled, setStreamingEnabled] = useState(true)
   const [appPassword, setAppPassword] = useState<string>(() => sessionStorage.getItem('researcher_app_password') || '')
   const [passwordInput, setPasswordInput] = useState('')
@@ -492,28 +492,9 @@ export function ChatInterface() {
           <div className="flex items-center justify-between">
             <span className="text-xs text-slate-500">LLM Provider:</span>
             <div className="flex gap-2">
-              <button
-                onClick={() => setProvider('anthropic')}
-                disabled={isLoading}
-                className={`px-3 py-1 text-xs rounded-full transition-colors ${
-                  provider === 'anthropic'
-                    ? 'bg-violet-600 text-white'
-                    : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
-                } disabled:opacity-50`}
-              >
-                Anthropic
-              </button>
-              <button
-                onClick={() => setProvider('openai')}
-                disabled={isLoading}
-                className={`px-3 py-1 text-xs rounded-full transition-colors ${
-                  provider === 'openai'
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-white text-slate-600 border border-slate-300 hover:bg-slate-100'
-                } disabled:opacity-50`}
-              >
+              <span className="px-3 py-1 text-xs rounded-full bg-emerald-600 text-white">
                 OpenAI
-              </button>
+              </span>
             </div>
           </div>
           <div className="flex items-center justify-between">
