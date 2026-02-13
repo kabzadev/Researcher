@@ -1,11 +1,11 @@
-import { Menu, X, Search, MessageSquare, Settings, FileText, FlaskConical } from 'lucide-react'
+import { Menu, X, Search, MessageSquare, Settings, FileText, FlaskConical, History } from 'lucide-react'
 
 interface LayoutProps {
   children: React.ReactNode
   sidebarOpen: boolean
   onToggleSidebar: () => void
-  page: 'research' | 'dashboard' | 'eval'
-  onSelectPage: (page: 'research' | 'dashboard' | 'eval') => void
+  page: 'research' | 'history' | 'dashboard' | 'eval' | 'settings'
+  onSelectPage: (page: 'research' | 'history' | 'dashboard' | 'eval' | 'settings') => void
 }
 
 export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectPage }: LayoutProps) {
@@ -23,16 +23,15 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
 
       {/* Left Sidebar */}
       <aside
-        className={`bg-white border-r border-slate-200 transition-transform duration-200 flex flex-col fixed md:static inset-y-0 left-0 z-40 w-64 ${
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
-        }`}
+        className={`bg-white border-r border-slate-200 transition-transform duration-200 flex flex-col fixed md:static inset-y-0 left-0 z-40 w-64 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+          }`}
       >
         <div className="p-4 border-b border-slate-200 flex-shrink-0">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 bg-primary rounded-lg flex items-center justify-center">
               <Search className="w-5 h-5 text-white" />
             </div>
-            <span className="font-semibold text-slate-800">Researcher</span>
+            <span className="font-semibold text-slate-800">KAIA Researcher</span>
           </div>
         </div>
 
@@ -42,6 +41,12 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
             label="New Research"
             active={page === 'research'}
             onClick={() => onSelectPage('research')}
+          />
+          <NavButton
+            icon={<History className="w-4 h-4" />}
+            label="History"
+            active={page === 'history'}
+            onClick={() => onSelectPage('history')}
           />
           <NavButton
             icon={<FileText className="w-4 h-4" />}
@@ -55,12 +60,17 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
             active={page === 'eval'}
             onClick={() => onSelectPage('eval')}
           />
-          <NavItem icon={<Settings className="w-4 h-4" />} label="Settings" />
+          <NavButton
+            icon={<Settings className="w-4 h-4" />}
+            label="Settings"
+            active={page === 'settings'}
+            onClick={() => onSelectPage('settings')}
+          />
         </nav>
 
         <div className="p-4 border-t border-slate-200 bg-white flex-shrink-0">
           <div className="text-xs text-slate-500">
-            <p className="font-medium">Researcher v0.1</p>
+            <p className="font-medium">KAIA Researcher v0.1</p>
             <p>Hypothesis-driven research</p>
           </div>
         </div>
@@ -76,7 +86,7 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
           >
             {sidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
           </button>
-          <h1 className="font-semibold text-slate-800">Research Assistant</h1>
+          <h1 className="font-semibold text-slate-800">KAIA Research Assistant</h1>
           <div className="flex-1" />
           <div className="flex items-center gap-2">
             <button
@@ -85,7 +95,7 @@ export function Layout({ children, sidebarOpen, onToggleSidebar, page, onSelectP
                 try {
                   sessionStorage.removeItem('researcher_app_password')
                   // keep chat history unless you want a full wipe
-                } catch {}
+                } catch { }
                 window.location.reload()
               }}
               className="px-3 py-1 text-sm rounded-full border border-slate-300 text-slate-700 hover:bg-slate-100"
@@ -113,11 +123,10 @@ function NavButton({ icon, label, active = false, onClick }: { icon: React.React
     <button
       type="button"
       onClick={onClick}
-      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
-        active
-          ? 'bg-primary/10 text-primary font-medium'
-          : 'text-slate-600 hover:bg-slate-100'
-      }`}
+      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${active
+        ? 'bg-primary/10 text-primary font-medium'
+        : 'text-slate-600 hover:bg-slate-100'
+        }`}
     >
       {icon}
       {label}
@@ -125,18 +134,4 @@ function NavButton({ icon, label, active = false, onClick }: { icon: React.React
   )
 }
 
-function NavItem({ icon, label, active = false }: { icon: React.ReactNode; label: string; active?: boolean }) {
-  return (
-    <a
-      href="#"
-      className={`flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ${
-        active
-          ? 'bg-primary/10 text-primary font-medium'
-          : 'text-slate-600 hover:bg-slate-100'
-      }`}
-    >
-      {icon}
-      {label}
-    </a>
-  )
-}
+

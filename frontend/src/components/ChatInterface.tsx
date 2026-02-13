@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { Send, Loader2, ExternalLink, Sparkles } from 'lucide-react'
+import { saveToHistory } from '../lib/historyStore'
+import { loadSettings } from '../lib/settingsStore'
 
 interface Message {
   id: string
@@ -118,7 +120,7 @@ export function ChatInterface() {
         if (data.coaching) {
           const suggestions = (data.coaching.suggested_questions || []) as string[]
           const need = (data.coaching.need || []) as string[]
-          return {
+          const msg: Message = {
             id: assistantId,
             role: 'assistant',
             provider: data.provider_used || provider,
@@ -131,6 +133,17 @@ export function ChatInterface() {
                 ? `Try one of these:\n${suggestions.map((s) => `• ${s}`).join('\n')}`
                 : ''),
           }
+          saveToHistory({
+            question: input,
+            provider: data.provider_used || provider,
+            runId: data.run_id,
+            content: msg.content,
+            brand: data.brand,
+            direction: data.direction,
+            metrics: data.metrics,
+            coaching: data.coaching,
+          })
+          return msg
         }
 
         const hasFindings =
@@ -139,7 +152,7 @@ export function ChatInterface() {
           (data.summary?.competitive_drivers?.length || 0) > 0
 
         if (!hasFindings) {
-          return {
+          const msg: Message = {
             id: assistantId,
             role: 'assistant',
             content: `I researched **${data.brand}** for the ${data.direction} in ${data.metrics?.[0] || 'salience'}, but no validating evidence was found from web searches.\n\nThis could mean:\n• The news hasn't been indexed yet\n• The search queries need refinement\n• No major external factors were reported during this period`,
@@ -152,9 +165,22 @@ export function ChatInterface() {
             ],
             drivers: { macro: [], brand: [], competitive: [] }
           }
+          saveToHistory({
+            question: input,
+            provider: data.provider_used || provider,
+            runId: data.run_id,
+            latencyMs: data.latency_ms,
+            content: msg.content,
+            brand: data.brand,
+            direction: data.direction,
+            metrics: data.metrics,
+            thinking: msg.thinking,
+            drivers: msg.drivers,
+          })
+          return msg
         }
 
-        return {
+        const msg: Message = {
           id: assistantId,
           role: 'assistant',
           content: `Based on my research for **${data.brand}**, here are the external factors that may have contributed to the ${data.direction} in ${data.metrics?.[0] || 'salience'}:`,
@@ -171,6 +197,19 @@ export function ChatInterface() {
             competitive: (data.summary?.competitive_drivers || []).map(transformDriver)
           }
         }
+        saveToHistory({
+          question: input,
+          provider: data.provider_used || provider,
+          runId: data.run_id,
+          latencyMs: data.latency_ms,
+          content: msg.content,
+          brand: data.brand,
+          direction: data.direction,
+          metrics: data.metrics,
+          thinking: msg.thinking,
+          drivers: msg.drivers,
+        })
+        return msg
       }
 
       // Add placeholder assistant message
@@ -184,6 +223,8 @@ export function ChatInterface() {
         }
       ])
 
+      const settings = loadSettings()
+
       if (!streamingEnabled) {
         // Non-streaming mode (wait for full response)
         const response = await fetch(`${API_URL}/research`, {
@@ -192,7 +233,7 @@ export function ChatInterface() {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${appPassword}`
           },
-          body: JSON.stringify({ question: input, provider, search_backend: provider === 'openai' ? 'openai' : 'tavily' })
+          body: JSON.stringify({ question: input, provider, search_backend: provider === 'openai' ? 'openai' : 'tavily', system_prompt: settings.systemPrompt || undefined, max_hypotheses_per_category: settings.maxHypothesesPerCategory })
         })
 
         if (!response.ok) {
@@ -213,7 +254,7 @@ export function ChatInterface() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${appPassword}`
         },
-        body: JSON.stringify({ question: input, provider, search_backend: provider === 'openai' ? 'openai' : 'tavily' })
+        body: JSON.stringify({ question: input, provider, search_backend: provider === 'openai' ? 'openai' : 'tavily', system_prompt: settings.systemPrompt || undefined, max_hypotheses_per_category: settings.maxHypothesesPerCategory })
       })
 
       if (!response.ok) {
@@ -284,7 +325,7 @@ export function ChatInterface() {
         // If password is wrong/rotated, force re-login instead of trapping the user.
         try {
           sessionStorage.removeItem('researcher_app_password')
-        } catch {}
+        } catch { }
         setAppPassword('')
         errorMsg = "⚠️ **Unauthorized (401)**\n\nYour saved app password is no longer valid. I logged you out — please re-enter the password to continue."
       } else if (status === 402) {
@@ -357,20 +398,18 @@ export function ChatInterface() {
             className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
           >
             <div
-              className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-                message.role === 'user'
-                  ? 'bg-primary text-white'
-                  : 'bg-white border border-slate-200 shadow-sm'
-              }`}
+              className={`max-w-[85%] rounded-2xl px-4 py-3 ${message.role === 'user'
+                ? 'bg-primary text-white'
+                : 'bg-white border border-slate-200 shadow-sm'
+                }`}
             >
               {/* Provider badge for assistant messages */}
               {message.role === 'assistant' && message.provider && (
                 <div className="mb-2">
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${
-                    message.provider === 'anthropic' 
-                      ? 'bg-violet-100 text-violet-700' 
-                      : 'bg-emerald-100 text-emerald-700'
-                  }`}>
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${message.provider === 'anthropic'
+                    ? 'bg-violet-100 text-violet-700'
+                    : 'bg-emerald-100 text-emerald-700'
+                    }`}>
                     {message.provider === 'anthropic' ? '🤖 Claude' : '⚡ GPT'}
                   </span>
                 </div>
@@ -457,7 +496,7 @@ export function ChatInterface() {
 
                   {/* Brand News */}
                   <DriverSection
-                    title="🏷️ Brand News (New Look)"
+                    title="🏷️ Brand News"
                     color="green"
                     drivers={message.drivers.brand}
                   />

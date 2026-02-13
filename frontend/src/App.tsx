@@ -4,8 +4,10 @@ import { Layout } from './components/Layout'
 import { ChatInterface } from './components/ChatInterface'
 import { Dashboard } from './components/Dashboard'
 import { Eval } from './components/Eval'
+import { History } from './components/History'
+import { Settings } from './components/Settings'
 
-type Page = 'research' | 'dashboard' | 'eval'
+type Page = 'research' | 'history' | 'dashboard' | 'eval' | 'settings'
 
 function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => {
@@ -22,7 +24,7 @@ function App() {
       page={page}
       onSelectPage={setPage}
     >
-      {page === 'research' ? <ChatInterface /> : page === 'dashboard' ? <Dashboard /> : <Eval />}
+      {page === 'research' ? <ChatInterface /> : page === 'history' ? <History /> : page === 'dashboard' ? <Dashboard /> : page === 'settings' ? <Settings /> : <Eval />}
     </Layout>
   )
 }

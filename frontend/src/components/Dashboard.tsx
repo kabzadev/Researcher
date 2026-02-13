@@ -87,14 +87,14 @@ export function Dashboard() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card title="Runs" value={summary?.runs ?? '—'} sub={`Errors: ${summary?.errors ?? '—'}`} />
         <Card title="Latency" value={summary?.p50_latency_ms ? `${summary?.p50_latency_ms}ms` : '—'} sub={`p95: ${summary?.p95_latency_ms ? `${summary?.p95_latency_ms}ms` : '—'}`} />
-        <Card title="Tokens" value={summary?.tokens_total ?? '—'} sub={`Tavily: ${summary?.tavily_searches ?? '—'} (2nd pass ${summary?.tavily_second_passes ?? '—'})`} />
+        <Card title="Tokens Used" value={summary?.tokens_total ? summary.tokens_total.toLocaleString() : '—'} sub={`Searches: ${summary?.tavily_searches ?? '—'}`} />
       </div>
 
       <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
           <h3 className="font-medium text-slate-900">Recent Runs</h3>
           <div className="text-xs text-slate-500">
-            Providers: {summary?.providers ? Object.entries(summary.providers).map(([k,v]) => `${k}:${v}`).join(' • ') : '—'}
+            Providers: {summary?.providers ? Object.entries(summary.providers).map(([k, v]) => `${k}:${v}`).join(' • ') : '—'}
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -105,8 +105,7 @@ export function Dashboard() {
                 <th className="text-left px-4 py-2">Provider</th>
                 <th className="text-left px-4 py-2">Brand</th>
                 <th className="text-left px-4 py-2">Latency</th>
-                <th className="text-left px-4 py-2">Tokens</th>
-                <th className="text-left px-4 py-2">Tavily</th>
+                <th className="text-right px-4 py-2">Tokens</th>
                 <th className="text-left px-4 py-2">Validated</th>
                 <th className="text-left px-4 py-2">Question</th>
               </tr>
@@ -118,8 +117,7 @@ export function Dashboard() {
                   <td className="px-4 py-2 whitespace-nowrap">{r.provider}</td>
                   <td className="px-4 py-2 whitespace-nowrap">{r.brand || '—'}</td>
                   <td className="px-4 py-2 whitespace-nowrap">{r.latency_ms}ms</td>
-                  <td className="px-4 py-2 whitespace-nowrap">{r.tokens_total}</td>
-                  <td className="px-4 py-2 whitespace-nowrap">{r.tavily_searches} (2nd {r.tavily_second_passes})</td>
+                  <td className="px-4 py-2 whitespace-nowrap text-right tabular-nums text-slate-600">{r.tokens_total ? r.tokens_total.toLocaleString() : '—'}</td>
                   <td className="px-4 py-2 whitespace-nowrap">
                     {r.validated_counts ? `${r.validated_counts.market}/${r.validated_counts.brand}/${r.validated_counts.competitive}` : '—'}
                   </td>
@@ -128,7 +126,7 @@ export function Dashboard() {
               ))}
               {runs.length === 0 && (
                 <tr>
-                  <td className="px-4 py-6 text-slate-500" colSpan={8}>No runs logged yet.</td>
+                  <td className="px-4 py-6 text-slate-500" colSpan={7}>No runs logged yet.</td>
                 </tr>
               )}
             </tbody>

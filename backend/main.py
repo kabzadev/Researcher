@@ -282,6 +282,8 @@ class ResearchRequest(BaseModel):
     provider: Optional[str] = Field(default=None, description="LLM provider: 'anthropic' or 'openai'. Uses DEFAULT_LLM_PROVIDER env var if not specified.")
     # Search backend is only honored when provider=='openai' (per product decision).
     search_backend: Optional[str] = Field(default=None, description="Web search backend. For provider=openai: 'tavily' (default) or 'openai' (Responses web_search). Ignored for anthropic.")
+    system_prompt: Optional[str] = Field(default=None, description="Optional system prompt prepended to all LLM calls for this request.")
+    max_hypotheses_per_category: Optional[int] = Field(default=None, ge=1, le=10, description="Max hypotheses per category (market/brand/competitive). Default: 4.")
 
 class ResearchResponse(BaseModel):
     question: str
@@ -339,7 +341,7 @@ def _run_llm_record(call: dict):
 
 
 # LLM Abstraction Layer
-def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 1000) -> str:
+def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 1000, system_prompt: Optional[str] = None) -> str:
     """Generate text using the specified LLM provider.
 
     Also records per-call telemetry into the current run context (if present).
@@ -350,11 +352,14 @@ def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 
 
     if chosen_provider == "anthropic":
         client = get_anthropic_client()
-        response = client.messages.create(
+        kwargs = dict(
             model=ANTHROPIC_MODEL,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        response = client.messages.create(**kwargs)
         text = response.content[0].text
         usage_obj = getattr(response, "usage", None)
         in_toks = int(getattr(usage_obj, "input_tokens", 0) or 0)
@@ -379,10 +384,14 @@ def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 
 
     if chosen_provider == "openai":
         client = get_openai_client()
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
         )
         text = response.choices[0].message.content or ""
         usage_obj = getattr(response, "usage", None)
@@ -861,7 +870,7 @@ def research(req: ResearchRequest):
         competitors = COMPETITOR_DB.get(parsed["brand"], [])
         
         # Step 3: Generate hypotheses
-        hypotheses = generate_hypotheses(parsed, competitors, provider=provider)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
         
         # Step 4: Process hypotheses in parallel (search + validate)
         validated, meta = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
@@ -1033,7 +1042,7 @@ def research_stream(req: ResearchRequest):
         yield sse("competitors", {"competitors": competitors})
 
         # Step 3: Generate hypotheses
-        hypotheses = generate_hypotheses(parsed, competitors, provider=provider)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
         yield sse("hypotheses", hypotheses)
 
         # Step 4: Process hypotheses in parallel and stream results
@@ -1273,17 +1282,18 @@ def extract_json(text: str) -> Dict:
     
     return {}
 
-def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional[str] = None) -> Dict[str, List[Dict]]:
+def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional[str] = None, max_per_category: int = 4, system_prompt: Optional[str] = None) -> Dict[str, List[Dict]]:
     """Generate hypotheses for market, brand, and competitive factors"""
     
     brand = parsed["brand"]
     direction = parsed["direction"]
     time_period = parsed.get("time_period", "2025")
+    n = max_per_category
     
     hypotheses = {"market": [], "brand": [], "competitive": []}
     
     # Market hypotheses - use static fallback if LLM fails
-    market_prompt = f"""Generate 3-4 hypotheses about UK fashion retail MARKET trends 
+    market_prompt = f"""Generate {n} hypotheses about UK fashion retail MARKET trends 
     that could cause {direction} in brand salience for {brand}.
     
     Time period: {time_period}
@@ -1292,9 +1302,9 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     {{"hypotheses": [{{"id": "M1", "hypothesis": "description", "search_query": "UK fashion trend Q3 2025"}}]}}"""
     
     try:
-        content = llm_generate(market_prompt, provider=provider, max_tokens=1000)
+        content = llm_generate(market_prompt, provider=provider, max_tokens=1000, system_prompt=system_prompt)
         data = extract_json(content)
-        hypotheses["market"] = data.get("hypotheses", [])
+        hypotheses["market"] = data.get("hypotheses", [])[:n]
     except Exception as e:
         print(f"Market hypothesis error: {e}")
     
@@ -1304,10 +1314,10 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
             {"id": "M1", "hypothesis": f"Economic downturn affecting fashion spending in {time_period}", "search_query": f"UK fashion spending economy {time_period}"},
             {"id": "M2", "hypothesis": "Online shopping shift away from physical retail", "search_query": f"UK online fashion shopping growth {time_period}"},
             {"id": "M3", "hypothesis": "Seasonal trends or weather impacting fashion sales", "search_query": f"UK fashion sales weather seasonal {time_period}"}
-        ]
+        ][:n]
     
     # Brand hypotheses
-    brand_prompt = f"""Generate 3-4 hypotheses about {brand}'s specific actions or issues 
+    brand_prompt = f"""Generate {n} hypotheses about {brand}'s specific actions or issues 
     that could cause brand salience to {direction}.
     Areas: advertising spend, store activity, marketing campaigns, PR, news coverage.
     
@@ -1317,9 +1327,9 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     {{"hypotheses": [{{"id": "B1", "hypothesis": "description", "search_query": "{brand} store closures 2025"}}]}}"""
     
     try:
-        content = llm_generate(brand_prompt, provider=provider, max_tokens=1000)
+        content = llm_generate(brand_prompt, provider=provider, max_tokens=1000, system_prompt=system_prompt)
         data = extract_json(content)
-        hypotheses["brand"] = data.get("hypotheses", [])
+        hypotheses["brand"] = data.get("hypotheses", [])[:n]
     except Exception as e:
         print(f"Brand hypothesis error: {e}")
     
@@ -1329,11 +1339,11 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
             {"id": "B1", "hypothesis": f"{brand} store closures or reduced presence", "search_query": f"{brand} store closures {time_period}"},
             {"id": "B2", "hypothesis": f"{brand} marketing or advertising spend changes", "search_query": f"{brand} advertising marketing {time_period}"},
             {"id": "B3", "hypothesis": f"News or media coverage about {brand}", "search_query": f"{brand} news media {time_period}"}
-        ]
+        ][:n]
     
     # Competitive hypotheses
     comp_list = ', '.join(competitors[:6]) if competitors else "main competitors"
-    comp_prompt = f"""Generate 3-4 hypotheses about competitor actions affecting {brand}'s salience.
+    comp_prompt = f"""Generate {n} hypotheses about competitor actions affecting {brand}'s salience.
     Competitors to consider: {comp_list}
     Time period: {time_period}
     
@@ -1341,9 +1351,9 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     {{"hypotheses": [{{"id": "C1", "hypothesis": "competitor action", "search_query": "Zara campaign UK 2025"}}]}}"""
     
     try:
-        content = llm_generate(comp_prompt, provider=provider, max_tokens=1000)
+        content = llm_generate(comp_prompt, provider=provider, max_tokens=1000, system_prompt=system_prompt)
         data = extract_json(content)
-        hypotheses["competitive"] = data.get("hypotheses", [])
+        hypotheses["competitive"] = data.get("hypotheses", [])[:n]
     except Exception as e:
         print(f"Competitive hypothesis error: {e}")
     
@@ -1354,7 +1364,7 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
             {"id": "C1", "hypothesis": f"{comp_fallback[0]} launched major marketing campaign", "search_query": f"{comp_fallback[0]} marketing campaign UK {time_period}"},
             {"id": "C2", "hypothesis": f"{comp_fallback[1] if len(comp_fallback) > 1 else comp_fallback[0]} store expansion or new initiatives", "search_query": f"{comp_fallback[1] if len(comp_fallback) > 1 else comp_fallback[0]} stores UK {time_period}"},
             {"id": "C3", "hypothesis": "Competitor news or media dominance", "search_query": f"UK fashion retailers competition {time_period}"}
-        ]
+        ][:n]
     
     return hypotheses
 
