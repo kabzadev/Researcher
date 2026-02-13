@@ -38,7 +38,7 @@ except Exception:
 from pydantic import BaseModel, Field
 import anthropic
 import openai
-from openai import OpenAI
+from openai import OpenAI, AzureOpenAI
 from tavily import TavilyClient
 
 app = FastAPI(title="Researcher API", version="0.1.0")
@@ -122,6 +122,7 @@ def _logs_client():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://delightful-glacier-01802140f.4.azurestaticapps.net",
         "https://orange-island-01010220f.2.azurestaticapps.net",
         "http://localhost:5173",  # Local dev
         "http://localhost:3000",
@@ -152,7 +153,16 @@ def get_openai_client():
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
-        openai_client = OpenAI(api_key=api_key)
+        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+        if azure_endpoint:
+            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+            openai_client = AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=api_version,
+            )
+        else:
+            openai_client = OpenAI(api_key=api_key)
     return openai_client
 
 def get_tavily_client():
