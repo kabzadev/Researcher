@@ -213,7 +213,8 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     sources: List[Dict[str, Any]] = []
     message_text = ""
 
-    # First pass: collect source URLs and message text
+    # First pass: collect source URLs from action.sources (standard OpenAI)
+    # and url_citation annotations (Azure OpenAI), plus message text
     for item in (d.get("output") or []):
         t = item.get("type")
         if t == "web_search_call":
@@ -231,23 +232,37 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
             for c in (item.get("content") or []):
                 if c.get("text"):
                     message_text = c["text"]
-                    break
+                # Azure OpenAI: citations are in annotations with type 'url_citation'
+                for annot in (c.get("annotations") or []):
+                    if annot.get("type") == "url_citation":
+                        url = annot.get("url") or ""
+                        if url and not any(s["url"] == url for s in sources):
+                            sources.append({
+                                "title": annot.get("title") or "",
+                                "url": url,
+                                "content": "",
+                                "raw_content": "",
+                            })
 
-    # For OpenAI web search, the LLM message IS the analyzed content.
-    # Return it as a single synthetic source with the actual analysis.
+    # Return the LLM's analysis text as a synthetic source, plus individual sources
     if message_text:
-        return [{
+        result = [{
             "title": "Web Search Analysis",
             "url": sources[0]["url"] if sources else "",
             "content": message_text[:6000],
             "raw_content": message_text[:6000],
         }]
+        # Also include individual citation sources so the pipeline has URLs
+        for s in sources[:max_sources]:
+            if s["url"] != result[0]["url"]:
+                result.append(s)
+        return result
 
     return sources[:max_sources]
 
 
 @app.get("/debug/web-search")
-async def debug_web_search(request: Request, q: str = "new look fashion UK 2025"):
+async def debug_web_search(request: Request, q: str = "new look fashion UK 2025", raw: bool = False):
     """Debug endpoint to inspect raw OpenAI web_search response structure."""
     try:
         client = get_openai_client()
@@ -259,6 +274,8 @@ async def debug_web_search(request: Request, q: str = "new look fashion UK 2025"
             input=q,
         )
         d = resp.model_dump() if hasattr(resp, "model_dump") else {}
+        if raw:
+            return d
         # Summarize output items
         summary = []
         for i, item in enumerate(d.get("output") or []):
@@ -278,6 +295,11 @@ async def debug_web_search(request: Request, q: str = "new look fashion UK 2025"
                     if c.get("text"):
                         entry["text_preview"] = c["text"][:500]
                         break
+                    # Check for annotations (Azure puts url_citation here)
+                    annots = c.get("annotations") or []
+                    if annots:
+                        entry["annotations_count"] = len(annots)
+                        entry["annotation_0"] = annots[0] if annots else None
             summary.append(entry)
         return {"output_count": len(d.get("output", [])), "items": summary, "model": d.get("model"), "usage": d.get("usage")}
     except Exception as e:
