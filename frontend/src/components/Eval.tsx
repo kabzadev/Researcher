@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Play, RefreshCcw } from 'lucide-react'
 
 // Keep consistent with other components (production-safe default).
-const API_URL = import.meta.env.VITE_API_URL || 'https://researcher-api.thankfulwave-8ed54622.eastus2.azurecontainerapps.io'
+const API_URL = import.meta.env.VITE_API_URL || 'https://kaia-researcher-api.icyglacier-f068d1b2.eastus.azurecontainerapps.io'
 
 type EvalQuestion = {
   id: string
@@ -35,24 +35,24 @@ export function Eval() {
 
   useEffect(() => {
     let mounted = true
-    ;(async () => {
-      try {
-        setError(null)
-        const res = await fetch(`${API_URL}/eval/questions`, {
-          headers: {
-            Authorization: `Bearer ${appPassword}`
+      ; (async () => {
+        try {
+          setError(null)
+          const res = await fetch(`${API_URL}/eval/questions`, {
+            headers: {
+              Authorization: `Bearer ${appPassword}`
+            }
+          })
+          if (!res.ok) {
+            const txt = await res.text()
+            throw new Error(`Failed to load eval questions (${res.status}): ${txt}`)
           }
-        })
-        if (!res.ok) {
-          const txt = await res.text()
-          throw new Error(`Failed to load eval questions (${res.status}): ${txt}`)
+          const data = await res.json()
+          if (mounted) setQuestions(data.questions || [])
+        } catch (e: any) {
+          if (mounted) setError(e?.message || String(e))
         }
-        const data = await res.json()
-        if (mounted) setQuestions(data.questions || [])
-      } catch (e: any) {
-        if (mounted) setError(e?.message || String(e))
-      }
-    })()
+      })()
 
     return () => {
       mounted = false

@@ -81,7 +81,7 @@ export function ChatInterface() {
     }
   }, [messages])
 
-  const API_URL = 'https://researcher-api.thankfulwave-8ed54622.eastus2.azurecontainerapps.io'
+  const API_URL = 'https://kaia-researcher-api.icyglacier-f068d1b2.eastus.azurecontainerapps.io'
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return

@@ -14,10 +14,6 @@ param location string = resourceGroup().location
 @secure()
 param appPassword string
 
-@description('Tavily API key for web search')
-@secure()
-param tavilyApiKey string
-
 @description('Container image tag to deploy')
 param containerImageTag string = 'v1'
 
@@ -43,9 +39,9 @@ param minReplicas int = 1
 param maxReplicas int = 3
 
 // Resource naming
-var uniqueSuffix = uniqueString(resourceGroup().id)
-var acrName = '${replace(baseName, '-', '')}${uniqueSuffix}'
-var kvName = '${baseName}-kv-${uniqueSuffix}'
+var suffix = substring(uniqueString(resourceGroup().id), 0, 6)
+var acrName = '${replace(baseName, '-', '')}${suffix}'
+var kvName = '${baseName}-kv${suffix}'
 var openAiName = '${baseName}-openai'
 var logAnalyticsName = '${baseName}-law'
 var containerAppEnvName = '${baseName}-env'
@@ -119,14 +115,6 @@ resource kvSecretAppPassword 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   }
 }
 
-resource kvSecretTavily 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: 'tavily-api-key'
-  properties: {
-    value: tavilyApiKey
-  }
-}
-
 resource kvSecretOpenAi 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   parent: keyVault
   name: 'openai-api-key'
@@ -187,10 +175,6 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
           value: openAi.listKeys().key1
         }
         {
-          name: 'tavily-api-key'
-          value: tavilyApiKey
-        }
-        {
           name: 'app-password'
           value: appPassword
         }
@@ -211,7 +195,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
       containers: [
         {
           name: 'researcher-api'
-          image: '${acr.properties.loginServer}/kaia-researcher-api:${containerImageTag}'
+          image: containerImageTag == 'placeholder' ? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' : '${acr.properties.loginServer}/kaia-researcher-api:${containerImageTag}'
           resources: {
             cpu: json(cpuCores)
             memory: memory
@@ -234,16 +218,16 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
               value: openAiModelName
             }
             {
-              name: 'TAVILY_API_KEY'
-              secretRef: 'tavily-api-key'
-            }
-            {
               name: 'RESEARCHER_APP_PASSWORD'
               secretRef: 'app-password'
             }
             {
               name: 'DEFAULT_LLM_PROVIDER'
               value: 'openai'
+            }
+            {
+              name: 'ENABLE_OPENAI_SEARCH'
+              value: 'true'
             }
             {
               name: 'LOG_ANALYTICS_WORKSPACE_ID'
@@ -289,28 +273,3 @@ output containerAppUrl string = containerApp.properties.configuration.ingress.fq
 output openAiEndpoint string = openAi.properties.endpoint
 output openAiDeployment string = openAiDeployment.name
 output logAnalyticsWorkspaceId string = logAnalytics.properties.customerId
-
-output deploymentGuide string = '''
-
-=== KAIA RESEARCHER — POST-DEPLOYMENT STEPS ===
-
-1. BUILD AND PUSH DOCKER IMAGE:
-   az acr login --name <acrName>
-   docker build -t <acrLoginServer>/kaia-researcher-api:v1 -f backend/Dockerfile backend
-   docker push <acrLoginServer>/kaia-researcher-api:v1
-
-2. UPDATE CONTAINER APP IMAGE:
-   az containerapp update --name kaia-researcher-api --resource-group Kantar \
-     --image <acrLoginServer>/kaia-researcher-api:v1
-
-3. UPDATE FRONTEND API_URL:
-   Point ChatInterface.tsx and Dashboard.tsx to: https://<containerAppUrl>
-
-4. DEPLOY FRONTEND TO STATIC WEB APP:
-   cd frontend && npm run build
-   npx @azure/static-web-apps-cli deploy ./dist --deployment-token <token>
-
-5. UPDATE CORS (if Container App URL changes):
-   Add new origin to backend/main.py CORS allow_origins
-
-'''

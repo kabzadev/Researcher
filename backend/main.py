@@ -123,7 +123,6 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://delightful-glacier-01802140f.4.azurestaticapps.net",
-        "https://orange-island-01010220f.2.azurestaticapps.net",
         "http://localhost:5173",  # Local dev
         "http://localhost:3000",
     ],

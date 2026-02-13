@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.37.4.10188",
-      "templateHash": "4357227571012143254"
+      "templateHash": "10560122680982526953"
     }
   },
   "parameters": {
@@ -27,12 +27,6 @@
       "type": "securestring",
       "metadata": {
         "description": "App password for the application"
-      }
-    },
-    "tavilyApiKey": {
-      "type": "securestring",
-      "metadata": {
-        "description": "Tavily API key for web search"
       }
     },
     "containerImageTag": {
@@ -176,17 +170,6 @@
     {
       "type": "Microsoft.KeyVault/vaults/secrets",
       "apiVersion": "2023-07-01",
-      "name": "[format('{0}/{1}', variables('kvName'), 'tavily-api-key')]",
-      "properties": {
-        "value": "[parameters('tavilyApiKey')]"
-      },
-      "dependsOn": [
-        "[resourceId('Microsoft.KeyVault/vaults', variables('kvName'))]"
-      ]
-    },
-    {
-      "type": "Microsoft.KeyVault/vaults/secrets",
-      "apiVersion": "2023-07-01",
       "name": "[format('{0}/{1}', variables('kvName'), 'openai-api-key')]",
       "properties": {
         "value": "[listKeys(resourceId('Microsoft.CognitiveServices/accounts', variables('openAiName')), '2023-10-01-preview').key1]"
@@ -249,10 +232,6 @@
               "value": "[listKeys(resourceId('Microsoft.CognitiveServices/accounts', variables('openAiName')), '2023-10-01-preview').key1]"
             },
             {
-              "name": "tavily-api-key",
-              "value": "[parameters('tavilyApiKey')]"
-            },
-            {
               "name": "app-password",
               "value": "[parameters('appPassword')]"
             },
@@ -296,16 +275,16 @@
                   "value": "[parameters('openAiModelName')]"
                 },
                 {
-                  "name": "TAVILY_API_KEY",
-                  "secretRef": "tavily-api-key"
-                },
-                {
                   "name": "RESEARCHER_APP_PASSWORD",
                   "secretRef": "app-password"
                 },
                 {
                   "name": "DEFAULT_LLM_PROVIDER",
                   "value": "openai"
+                },
+                {
+                  "name": "ENABLE_OPENAI_SEARCH",
+                  "value": "true"
                 },
                 {
                   "name": "LOG_ANALYTICS_WORKSPACE_ID",
@@ -379,10 +358,6 @@
     "logAnalyticsWorkspaceId": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('logAnalyticsName')), '2022-10-01').customerId]"
-    },
-    "deploymentGuide": {
-      "type": "string",
-      "value": "\n=== KAIA RESEARCHER — POST-DEPLOYMENT STEPS ===\n\n1. BUILD AND PUSH DOCKER IMAGE:\n   az acr login --name <acrName>\n   docker build -t <acrLoginServer>/kaia-researcher-api:v1 -f backend/Dockerfile backend\n   docker push <acrLoginServer>/kaia-researcher-api:v1\n\n2. UPDATE CONTAINER APP IMAGE:\n   az containerapp update --name kaia-researcher-api --resource-group Kantar \\\n     --image <acrLoginServer>/kaia-researcher-api:v1\n\n3. UPDATE FRONTEND API_URL:\n   Point ChatInterface.tsx and Dashboard.tsx to: https://<containerAppUrl>\n\n4. DEPLOY FRONTEND TO STATIC WEB APP:\n   cd frontend && npm run build\n   npx @azure/static-web-apps-cli deploy ./dist --deployment-token <token>\n\n5. UPDATE CORS (if Container App URL changes):\n   Add new origin to backend/main.py CORS allow_origins\n\n"
     }
   }
 }
