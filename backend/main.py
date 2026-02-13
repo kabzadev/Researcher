@@ -201,7 +201,7 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     Returns a list of dicts compatible with our existing pipeline:
       {"title": str, "url": str, "content": str, "raw_content": str}
 
-    Note: This is only enabled when provider=='openai' and request.search_backend=='openai'.
+    Includes retry with exponential backoff for 429 rate-limit errors.
     """
 
     client = get_openai_client()
@@ -214,13 +214,29 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
         tool_config["user_location"] = user_location
     tools: List[Dict[str, Any]] = [tool_config]
 
-    resp = client.responses.create(
-        model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
-        tools=tools,
-        temperature=0,
-        include=["web_search_call.action.sources"],
-        input=query,
-    )
+    # Retry with exponential backoff for 429 rate-limit errors
+    max_retries = 3
+    resp = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.responses.create(
+                model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
+                tools=tools,
+                temperature=0,
+                include=["web_search_call.action.sources"],
+                input=query,
+            )
+            break  # Success
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries:
+                wait_time = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                print(f"Rate limited (429) on attempt {attempt+1}, retrying in {wait_time}s: {query[:40]}...")
+                time.sleep(wait_time)
+                continue
+            raise  # Re-raise non-429 errors or final attempt
+
+    if resp is None:
+        return []
 
     d = resp.model_dump() if hasattr(resp, "model_dump") else {}
 
@@ -936,7 +952,7 @@ def research(req: ResearchRequest):
         competitors = COMPETITOR_DB.get(parsed["brand"], [])
         
         # Step 3: Generate hypotheses
-        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 3, system_prompt=req.system_prompt)
         
         # Step 4: Process hypotheses in parallel (search + validate)
         validated, meta = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
@@ -1114,7 +1130,7 @@ def research_stream(req: ResearchRequest):
 
         # Step 3: Generate hypotheses
         step3_start = time.time()
-        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 3, system_prompt=req.system_prompt)
         step3_ms = int((time.time() - step3_start) * 1000)
         total_hyps = sum(len(hypotheses.get(c, []) or []) for c in ["market", "brand", "competitive"])
         telemetry_logger.info("pipeline_step step=generate_hypotheses duration_ms=%d hypothesis_count=%d", step3_ms, total_hyps)
@@ -1172,40 +1188,40 @@ def research_stream(req: ResearchRequest):
             }
 
         step4_start = time.time()
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_task = {executor.submit(process_one, hyp, cat): (hyp, cat) for hyp, cat in tasks}
-            completed = 0
-            for future in as_completed(future_to_task):
-                completed += 1
-                hyp, cat = future_to_task[future]
-                try:
-                    item = future.result()
-                except Exception as e:
-                    item = {
-                        "category": cat,
-                        "hypothesis": hyp.get("hypothesis"),
-                        "validated": False,
-                        "error": str(e),
-                    }
-                if item.get("validated"):
-                    validated[cat].append(
-                        {
-                            "status": "VALIDATED",
-                            "hypothesis": item.get("hypothesis"),
-                            "evidence": item.get("evidence"),
-                            "source": item.get("source"),
-                            "source_title": item.get("source_title"),
-                        }
-                    )
-
-                yield sse(
-                    "hypothesis_result",
+        # Process hypotheses sequentially to avoid 429 rate limits.
+        # With search_context_size='high', each search uses significant tokens;
+        # parallel execution overwhelms the TPM quota.
+        completed = 0
+        for hyp, cat in tasks:
+            completed += 1
+            try:
+                item = process_one(hyp, cat)
+            except Exception as e:
+                item = {
+                    "category": cat,
+                    "hypothesis": hyp.get("hypothesis"),
+                    "validated": False,
+                    "error": str(e),
+                }
+            if item.get("validated"):
+                validated[cat].append(
                     {
-                        **item,
-                        "completed": completed,
-                        "total": len(tasks),
-                    },
+                        "status": "VALIDATED",
+                        "hypothesis": item.get("hypothesis"),
+                        "evidence": item.get("evidence"),
+                        "source": item.get("source"),
+                        "source_title": item.get("source_title"),
+                    }
                 )
+
+            yield sse(
+                "hypothesis_result",
+                {
+                    **item,
+                    "completed": completed,
+                    "total": len(tasks),
+                },
+            )
         step4_ms = int((time.time() - step4_start) * 1000)
         validated_count = sum(len(v) for v in validated.values())
         telemetry_logger.info(
@@ -1501,10 +1517,9 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             return {"category": cat, "_web_searches": 0, "_web_search_retries": 0}
 
         local_searches = 0
-        local_second = 0
 
         try:
-            # Pass 1: Web search
+            # Web search (single pass, no retry)
             print(f"Searching: {query[:50]}...")
             local_searches += 1
             try:
@@ -1519,70 +1534,42 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
                 validation = validate_hypothesis(hyp, r1, provider=provider)
                 print(f"Validation: {validation.get('validated')} - {validation.get('evidence', '')[:50]}...")
 
-            # Second pass: targeted retry when weak
-            second_pass_used = False
-            if (not eval_mode) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
-                q2 = refine_query(query)
-                if q2 and q2 != query:
-                    second_pass_used = True
-                    local_searches += 1
-                    local_second += 1
-                    print(f"2nd-pass search: {q2[:60]}...")
-                    try:
-                        r2 = openai_web_search(q2)
-                    except Exception as e:
-                        print(f"Web search second pass error: {e}")
-                        r2 = []
-                    combined = (r1 + r2)[:4]
-                    if combined:
-                        validation2 = validate_hypothesis(hyp, combined, provider=provider)
-                        if validation2.get("validated"):
-                            validation = validation2
-                            r1 = combined
-
             if r1 and validation.get("validated"):
                 return {
                     "category": cat,
                     "_web_searches": local_searches,
-                    "_web_search_retries": local_second,
+                    "_web_search_retries": 0,
                     "item": {
                         "status": "VALIDATED",
                         "hypothesis": hyp.get("hypothesis"),
                         "evidence": validation.get("evidence"),
                         "source": r1[0].get("url"),
                         "source_title": r1[0].get("title"),
-                        "second_pass_used": second_pass_used,
+                        "second_pass_used": False,
                     },
                 }
 
-            return {"category": cat, "_web_searches": local_searches, "_web_search_retries": local_second}
+            return {"category": cat, "_web_searches": local_searches, "_web_search_retries": 0}
 
         except Exception as e:
             error_msg = f"Search error for '{query[:30]}...': {str(e)}"
             print(error_msg)
             errors.append(error_msg)
-            return {"category": cat, "_web_searches": local_searches, "_web_search_retries": local_second, "error": str(e)}
+            return {"category": cat, "_web_searches": local_searches, "_web_search_retries": 0, "error": str(e)}
     
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_task = {executor.submit(process_one, hyp, cat): (hyp, cat) for hyp, cat in all_tasks}
-        
-        for future in as_completed(future_to_task):
-            hyp, cat = future_to_task[future]
-            try:
-                result = future.result() or {}
+    # Process sequentially to avoid 429 rate limits with Azure's TPM quota.
+    # With search_context_size='high', each search uses significant tokens.
+    for hyp, cat in all_tasks:
+        try:
+            result = process_one(hyp, cat) or {}
 
-                web_searches_total_nonlocal = int(result.get("_web_searches", 0) or 0)
-                web_search_retries_total_nonlocal = int(result.get("_web_search_retries", 0) or 0)
-                nonlocal_err = result.get("error")
+            web_searches_total += int(result.get("_web_searches", 0) or 0)
+            web_search_retries_total += int(result.get("_web_search_retries", 0) or 0)
 
-                # aggregate counts in main thread (contextvars don't propagate to threads)
-                web_searches_total += web_searches_total_nonlocal
-                web_search_retries_total += web_search_retries_total_nonlocal
-
-                if result.get("item") and not nonlocal_err:
-                    results[result.get("category", cat)].append(result["item"])
-            except Exception as e:
-                print(f"Thread error: {e}")
+            if result.get("item") and not result.get("error"):
+                results[result.get("category", cat)].append(result["item"])
+        except Exception as e:
+            print(f"Processing error: {e}")
     
     print(f"Results: market={len(results['market'])}, brand={len(results['brand'])}, competitive={len(results['competitive'])}")
     if errors:
