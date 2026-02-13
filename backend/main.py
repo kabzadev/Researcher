@@ -209,14 +209,15 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
 
     # Azure OpenAI requires 'web_search_preview'; standard OpenAI uses 'web_search'
     search_tool_type = "web_search_preview" if _is_azure else "web_search"
-    tools: List[Dict[str, Any]] = [{"type": search_tool_type}]
+    tool_config: Dict[str, Any] = {"type": search_tool_type, "search_context_size": "high"}
     if user_location:
-        tools = [{"type": search_tool_type, "user_location": user_location}]
+        tool_config["user_location"] = user_location
+    tools: List[Dict[str, Any]] = [tool_config]
 
     resp = client.responses.create(
         model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
         tools=tools,
-        tool_choice="auto",
+        temperature=0,
         include=["web_search_call.action.sources"],
         input=query,
     )
@@ -455,6 +456,7 @@ def llm_generate(prompt: str, provider: Optional[str] = None, max_tokens: int = 
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             max_tokens=max_tokens,
+            temperature=0,
             messages=messages,
         )
         text = response.choices[0].message.content or ""
@@ -1141,7 +1143,7 @@ def research_stream(req: ResearchRequest):
             if not query:
                 return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
 
-            # Pass 1: Web search
+            # Web search
             _run_metric_incr("web_searches", 1)
             try:
                 r1 = openai_web_search(query)
@@ -1152,27 +1154,8 @@ def research_stream(req: ResearchRequest):
             if r1:
                 validation = validate_hypothesis(hyp, r1, provider=provider)
 
-            # Second pass: retry with refined query when weak results
             second_pass_used = False
             second_query = None
-            if ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
-                q2 = refine_query(query)
-                if q2 and q2 != query:
-                    second_pass_used = True
-                    second_query = q2
-                    _run_metric_incr("web_searches", 1)
-                    _run_metric_incr("web_search_retries", 1)
-                    try:
-                        r2 = openai_web_search(q2)
-                    except Exception as e:
-                        print(f"Web search second pass error: {e}")
-                        r2 = []
-                    combined = (r1 + r2)[:4]
-                    if combined:
-                        validation2 = validate_hypothesis(hyp, combined, provider=provider)
-                        if validation2.get("validated"):
-                            validation = validation2
-                            r1 = combined
 
             return {
                 "category": cat,
@@ -1371,14 +1354,23 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     
     hypotheses = {"market": [], "brand": [], "competitive": []}
     
-    # Market hypotheses - use static fallback if LLM fails
-    market_prompt = f"""Generate {n} hypotheses about UK fashion retail MARKET trends 
-    that could cause {direction} in brand salience for {brand}.
-    
-    Time period: {time_period}
-    
-    Return ONLY a JSON object like:
-    {{"hypotheses": [{{"id": "M1", "hypothesis": "description", "search_query": "UK fashion trend Q3 2025"}}]}}"""
+    # Market hypotheses
+    market_prompt = f"""You are a brand research analyst. Generate exactly {n} specific hypotheses about macro market trends
+that could explain why {brand}'s brand salience {direction}d during {time_period}.
+
+Focus on CONCRETE, SEARCHABLE trends like:
+- Economic conditions (consumer spending, inflation, currency)
+- Industry shifts (athleisure growth, sustainability trends, digital fashion)
+- Consumer behavior changes (social media trends, shopping habits)
+- Regulatory or trade changes (tariffs, supply chain)
+
+IMPORTANT: Each search_query MUST include "{brand}" and "{time_period}" and be specific enough to find real news articles.
+
+Return ONLY a JSON object:
+{{"hypotheses": [
+  {{"id": "M1", "hypothesis": "specific trend description", "search_query": "{brand} specific trend {time_period}"}},
+  {{"id": "M2", "hypothesis": "another trend", "search_query": "{brand} another specific term {time_period}"}}
+]}}"""
     
     try:
         content = llm_generate(market_prompt, provider=provider, max_tokens=1000, system_prompt=system_prompt)
@@ -1390,20 +1382,30 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
     # Fallback market hypotheses
     if not hypotheses["market"]:
         hypotheses["market"] = [
-            {"id": "M1", "hypothesis": f"Economic downturn affecting fashion spending in {time_period}", "search_query": f"UK fashion spending economy {time_period}"},
-            {"id": "M2", "hypothesis": "Online shopping shift away from physical retail", "search_query": f"UK online fashion shopping growth {time_period}"},
-            {"id": "M3", "hypothesis": "Seasonal trends or weather impacting fashion sales", "search_query": f"UK fashion sales weather seasonal {time_period}"}
+            {"id": "M1", "hypothesis": f"Economic downturn affecting fashion spending in {time_period}", "search_query": f"{brand} fashion spending economy {time_period}"},
+            {"id": "M2", "hypothesis": "Online shopping shift away from physical retail", "search_query": f"{brand} online fashion shopping growth {time_period}"},
+            {"id": "M3", "hypothesis": "Seasonal trends or weather impacting fashion sales", "search_query": f"{brand} fashion sales seasonal {time_period}"}
         ][:n]
     
     # Brand hypotheses
-    brand_prompt = f"""Generate {n} hypotheses about {brand}'s specific actions or issues 
-    that could cause brand salience to {direction}.
-    Areas: advertising spend, store activity, marketing campaigns, PR, news coverage.
-    
-    Time period: {time_period}
-    
-    Return ONLY a JSON object like:
-    {{"hypotheses": [{{"id": "B1", "hypothesis": "description", "search_query": "{brand} store closures 2025"}}]}}"""
+    brand_prompt = f"""You are a brand research analyst. Generate exactly {n} specific hypotheses about {brand}'s own actions
+that could explain why its brand salience {direction}d during {time_period}.
+
+Focus on CONCRETE actions like:
+- Specific advertising campaigns or celebrity endorsements (name the celebrity/campaign)
+- Store openings, closures, or flagship launches (name the city/location)
+- Product launches or collections (name the product line)
+- PR events, controversies, or media coverage (name the event)
+- Sponsorship deals or partnerships (name the partner)
+
+IMPORTANT: Each hypothesis MUST mention a specific action, person, or event — not generic descriptions.
+Each search_query MUST include "{brand}" and "{time_period}".
+
+Return ONLY a JSON object:
+{{"hypotheses": [
+  {{"id": "B1", "hypothesis": "{brand} did X specific thing", "search_query": "{brand} specific action {time_period}"}},
+  {{"id": "B2", "hypothesis": "{brand} launched Y", "search_query": "{brand} Y launch {time_period}"}}
+]}}"""
     
     try:
         content = llm_generate(brand_prompt, provider=provider, max_tokens=1000, system_prompt=system_prompt)
@@ -1421,13 +1423,24 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
         ][:n]
     
     # Competitive hypotheses
-    comp_list = ', '.join(competitors[:6]) if competitors else "main competitors"
-    comp_prompt = f"""Generate {n} hypotheses about competitor actions affecting {brand}'s salience.
-    Competitors to consider: {comp_list}
-    Time period: {time_period}
-    
-    Return ONLY a JSON object like:
-    {{"hypotheses": [{{"id": "C1", "hypothesis": "competitor action", "search_query": "Zara campaign UK 2025"}}]}}"""
+    comp_list = ', '.join(competitors[:6]) if competitors else "Adidas, Puma, Under Armour, New Balance, Reebok"
+    comp_prompt = f"""You are a brand research analyst. Generate exactly {n} specific hypotheses about how NAMED competitors
+affected {brand}'s brand salience during {time_period}.
+
+Available competitors: {comp_list}
+
+CRITICAL RULES:
+1. Each hypothesis MUST name a SPECIFIC competitor brand (e.g., "Adidas", "Puma", not "a competitor")
+2. Each hypothesis should focus on a DIFFERENT competitor
+3. Include specific actions: campaigns, product launches, celebrity endorsements, store openings, viral moments
+4. Each search_query MUST include the competitor's name and "{time_period}"
+
+Return ONLY a JSON object:
+{{"hypotheses": [
+  {{"id": "C1", "hypothesis": "Adidas launched [specific campaign/product] that drew attention from {brand}", "search_query": "Adidas campaign launch {time_period}"}},
+  {{"id": "C2", "hypothesis": "Puma's [specific action] increased their visibility vs {brand}", "search_query": "Puma marketing news {time_period}"}},
+  {{"id": "C3", "hypothesis": "Under Armour [specific action] impacted {brand}'s market position", "search_query": "Under Armour news {time_period}"}}
+]}}"""
     
     try:
         content = llm_generate(comp_prompt, provider=provider, max_tokens=1000, system_prompt=system_prompt)
@@ -1584,10 +1597,9 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 def validate_hypothesis(hypothesis: Dict, search_results: List[Dict], provider: Optional[str] = None) -> Dict:
     """Use LLM to validate if search results support the hypothesis"""
     
-    # For web search analysis sources (Azure OpenAI), content can be longer and more valuable
-    # Use more chars for analysis sources vs regular search results
+    # Use generous content window for Azure OpenAI analysis sources
     search_text = "\n\n".join([
-        f"Title: {r.get('title', '')}\nContent: {r.get('raw_content', r.get('content', ''))[:1500]}"
+        f"Title: {r.get('title', '')}\nContent: {r.get('raw_content', r.get('content', ''))[:2000]}"
         for r in search_results[:3]
     ])
     
@@ -1596,7 +1608,8 @@ def validate_hypothesis(hypothesis: Dict, search_results: List[Dict], provider: 
 Search Results:
 {search_text}
 
-Does this search result contain direct evidence supporting the hypothesis?
+Does this search result contain relevant information that supports or relates to the hypothesis?
+Be generous — if the evidence is even partially relevant, validate it.
 Return JSON: {{"validated": true/false, "evidence": "SHORT factual summary (20 words max) with key numbers/dates"}}"""
     
     try:
