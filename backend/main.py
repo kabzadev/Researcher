@@ -149,20 +149,29 @@ def get_anthropic_client():
 def get_openai_client():
     global openai_client
     if openai_client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
         azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
         if azure_endpoint:
-            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21")
+            # Azure OpenAI: key-based auth is policy-blocked; use Managed Identity
+            from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+            credential = DefaultAzureCredential()
+            token_provider = get_bearer_token_provider(
+                credential, "https://cognitiveservices.azure.com/.default"
+            )
+            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
             openai_client = AzureOpenAI(
-                api_key=api_key,
+                azure_ad_token_provider=token_provider,
                 azure_endpoint=azure_endpoint,
                 api_version=api_version,
             )
         else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured")
             openai_client = OpenAI(api_key=api_key)
     return openai_client
+
+# Flag indicating whether we're running against Azure OpenAI
+_is_azure = bool(os.getenv("AZURE_OPENAI_ENDPOINT"))
 
 def get_tavily_client():
     global tavily_client
@@ -185,9 +194,11 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
 
     client = get_openai_client()
 
-    tools: List[Dict[str, Any]] = [{"type": "web_search"}]
+    # Azure OpenAI requires 'web_search_preview'; standard OpenAI uses 'web_search'
+    search_tool_type = "web_search_preview" if _is_azure else "web_search"
+    tools: List[Dict[str, Any]] = [{"type": search_tool_type}]
     if user_location:
-        tools = [{"type": "web_search", "user_location": user_location}]
+        tools = [{"type": search_tool_type, "user_location": user_location}]
 
     resp = client.responses.create(
         model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
@@ -242,7 +253,7 @@ async def debug_web_search(request: Request, q: str = "new look fashion UK 2025"
         client = get_openai_client()
         resp = client.responses.create(
             model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
-            tools=[{"type": "web_search"}],
+            tools=[{"type": "web_search_preview" if _is_azure else "web_search"}],
             tool_choice="auto",
             include=["web_search_call.action.sources"],
             input=q,
