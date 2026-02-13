@@ -1,7 +1,20 @@
 // ============================================================================
-// KAIA Researcher — Full Infrastructure (self-contained)
-// Deploys: Azure OpenAI + Key Vault + ACR + Container App + Log Analytics
-// Target RG: Kantar (MCAPS-Hybrid subscription)
+// KAIA Researcher — Full Infrastructure (self-contained, customer-ready)
+//
+// Deploys: Azure OpenAI (with gpt-4o) + Key Vault + ACR + Container App
+//          + Log Analytics + RBAC role assignments
+//
+// PREREQUISITES (run once per subscription before deploying):
+//   az feature unregister --name OpenAI.BlockedTools.web_search \
+//     --namespace Microsoft.CognitiveServices
+//   az provider register -n Microsoft.CognitiveServices
+//
+// USAGE:
+//   az group create -n <rg-name> -l eastus
+//   az deployment group create -g <rg-name> \
+//     --template-file deploy-kantar.bicep \
+//     --parameters appPassword='<password>' containerImageTag='placeholder'
+//   # Then: build/push Docker image and update Container App image tag
 // ============================================================================
 
 @description('Base name for all resources')
@@ -14,7 +27,7 @@ param location string = resourceGroup().location
 @secure()
 param appPassword string
 
-@description('Container image tag to deploy')
+@description('Container image tag to deploy (use "placeholder" for initial infra-only deploy)')
 param containerImageTag string = 'v1'
 
 @description('Azure OpenAI model to deploy')
@@ -22,6 +35,9 @@ param openAiModelName string = 'gpt-4o'
 
 @description('Azure OpenAI model version')
 param openAiModelVersion string = '2024-08-06'
+
+@description('Azure OpenAI API version for Responses API + web_search_preview')
+param openAiApiVersion string = '2025-04-01-preview'
 
 @description('Azure OpenAI deployment SKU capacity (1000s of tokens per minute)')
 param openAiCapacity int = 30
@@ -38,7 +54,7 @@ param minReplicas int = 1
 @description('Max replicas for Container App')
 param maxReplicas int = 3
 
-// Resource naming
+// Resource naming (suffix keeps names globally unique but short)
 var suffix = substring(uniqueString(resourceGroup().id), 0, 6)
 var acrName = '${replace(baseName, '-', '')}${suffix}'
 var kvName = '${baseName}-kv${suffix}'
@@ -46,6 +62,9 @@ var openAiName = '${baseName}-openai'
 var logAnalyticsName = '${baseName}-law'
 var containerAppEnvName = '${baseName}-env'
 var containerAppName = '${baseName}-api'
+
+// Well-known role definition IDs
+var cognitiveServicesOpenAiUserRoleId = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
 
 // ─── Azure OpenAI ───────────────────────────────────────────────────────────
 
@@ -59,6 +78,8 @@ resource openAi 'Microsoft.CognitiveServices/accounts@2023-10-01-preview' = {
   properties: {
     customSubDomainName: openAiName
     publicNetworkAccess: 'Enabled'
+    // Note: if subscription policy enforces disableLocalAuth=true,
+    // the backend uses Managed Identity (DefaultAzureCredential) instead of API keys
   }
 }
 
@@ -115,14 +136,6 @@ resource kvSecretAppPassword 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
   }
 }
 
-resource kvSecretOpenAi 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: 'openai-api-key'
-  properties: {
-    value: openAi.listKeys().key1
-  }
-}
-
 // ─── Container Registry ─────────────────────────────────────────────────────
 
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
@@ -171,10 +184,6 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
       }
       secrets: [
         {
-          name: 'openai-api-key'
-          value: openAi.listKeys().key1
-        }
-        {
           name: 'app-password'
           value: appPassword
         }
@@ -201,34 +210,29 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
             memory: memory
           }
           env: [
-            {
-              name: 'OPENAI_API_KEY'
-              secretRef: 'openai-api-key'
-            }
+            // Azure OpenAI — uses Managed Identity (DefaultAzureCredential), no API key needed
             {
               name: 'AZURE_OPENAI_ENDPOINT'
               value: openAi.properties.endpoint
             }
             {
               name: 'AZURE_OPENAI_API_VERSION'
-              value: '2024-10-21'
+              value: openAiApiVersion
             }
             {
               name: 'OPENAI_MODEL'
               value: openAiModelName
             }
             {
-              name: 'RESEARCHER_APP_PASSWORD'
-              secretRef: 'app-password'
-            }
-            {
               name: 'DEFAULT_LLM_PROVIDER'
               value: 'openai'
             }
+            // Application
             {
-              name: 'ENABLE_OPENAI_SEARCH'
-              value: 'true'
+              name: 'RESEARCHER_APP_PASSWORD'
+              secretRef: 'app-password'
             }
+            // Observability
             {
               name: 'LOG_ANALYTICS_WORKSPACE_ID'
               value: logAnalytics.properties.customerId
@@ -244,7 +248,22 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
   }
 }
 
-// Grant Container App access to Key Vault
+// ─── RBAC: Container App → Azure OpenAI ─────────────────────────────────────
+// Grants the Container App's Managed Identity "Cognitive Services OpenAI User"
+// role on the Azure OpenAI resource, enabling Entra ID / token-based auth.
+
+resource openAiRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(containerApp.id, openAi.id, cognitiveServicesOpenAiUserRoleId)
+  scope: openAi
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', cognitiveServicesOpenAiUserRoleId)
+    principalId: containerApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ─── RBAC: Container App → Key Vault ────────────────────────────────────────
+
 resource keyVaultAccessPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
   parent: keyVault
   name: 'add'
@@ -273,3 +292,36 @@ output containerAppUrl string = containerApp.properties.configuration.ingress.fq
 output openAiEndpoint string = openAi.properties.endpoint
 output openAiDeployment string = openAiDeployment.name
 output logAnalyticsWorkspaceId string = logAnalytics.properties.customerId
+
+// Post-deployment steps (printed as output for reference)
+output postDeploySteps string = '''
+=== POST-DEPLOYMENT STEPS ===
+
+1. ENABLE WEB SEARCH (one-time per subscription):
+   az feature unregister --name OpenAI.BlockedTools.web_search \
+     --namespace Microsoft.CognitiveServices
+   az provider register -n Microsoft.CognitiveServices
+
+2. BUILD AND PUSH DOCKER IMAGE:
+   az acr login --name <acrName>
+   docker build --platform linux/amd64 \
+     -t <acrLoginServer>/kaia-researcher-api:v1 \
+     -f backend/Dockerfile backend
+   docker push <acrLoginServer>/kaia-researcher-api:v1
+
+3. UPDATE CONTAINER APP IMAGE:
+   az containerapp update --name kaia-researcher-api \
+     --resource-group <rg> \
+     --image <acrLoginServer>/kaia-researcher-api:v1
+
+4. UPDATE FRONTEND API_URL:
+   Set API_URL in ChatInterface.tsx, Dashboard.tsx, Eval.tsx
+   to: https://<containerAppUrl>
+
+5. BUILD AND DEPLOY FRONTEND:
+   cd frontend && npm run build
+   npx @azure/static-web-apps-cli deploy ./dist \
+     --deployment-token <token>
+
+6. UPDATE CORS (add SWA URL to backend/main.py allow_origins)
+'''
