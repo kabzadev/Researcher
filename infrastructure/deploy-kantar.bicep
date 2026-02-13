@@ -40,7 +40,7 @@ param openAiModelVersion string = '2024-08-06'
 param openAiApiVersion string = '2025-04-01-preview'
 
 @description('Azure OpenAI deployment SKU capacity (1000s of tokens per minute)')
-param openAiCapacity int = 30
+param openAiCapacity int = 80
 
 @description('Container App CPU cores')
 param cpuCores string = '1.0'
@@ -62,6 +62,7 @@ var openAiName = '${baseName}-openai'
 var logAnalyticsName = '${baseName}-law'
 var containerAppEnvName = '${baseName}-env'
 var containerAppName = '${baseName}-api'
+var appInsightsName = '${baseName}-appinsights'
 
 // Well-known role definition IDs
 var cognitiveServicesOpenAiUserRoleId = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
@@ -109,6 +110,19 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
       name: 'PerGB2018'
     }
     retentionInDays: 30
+  }
+}
+
+// ─── Application Insights ───────────────────────────────────────────────────
+
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: appInsightsName
+  location: location
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: logAnalytics.id
+    RetentionInDays: 30
   }
 }
 
@@ -232,7 +246,11 @@ resource containerApp 'Microsoft.App/containerApps@2023-11-02-preview' = {
               name: 'RESEARCHER_APP_PASSWORD'
               secretRef: 'app-password'
             }
-            // Observability
+            // Observability (Application Insights via OpenTelemetry)
+            {
+              name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+              value: appInsights.properties.ConnectionString
+            }
             {
               name: 'LOG_ANALYTICS_WORKSPACE_ID'
               value: logAnalytics.properties.customerId
@@ -292,6 +310,7 @@ output containerAppUrl string = containerApp.properties.configuration.ingress.fq
 output openAiEndpoint string = openAi.properties.endpoint
 output openAiDeployment string = openAiDeployment.name
 output logAnalyticsWorkspaceId string = logAnalytics.properties.customerId
+output appInsightsConnectionString string = appInsights.properties.ConnectionString
 
 // Post-deployment steps (printed as output for reference)
 output postDeploySteps string = '''

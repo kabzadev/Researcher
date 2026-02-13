@@ -1,7 +1,7 @@
 """
 Researcher API - Hypothesis-driven brand metric analysis
 Supports both Anthropic Claude and OpenAI
-Uses Tavily for web search
+Uses OpenAI Responses API web search for evidence gathering
 """
 
 import os
@@ -26,6 +26,7 @@ try:
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     from opentelemetry.instrumentation.requests import RequestsInstrumentor
     from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry import trace as otel_trace
     from azure.monitor.query import LogsQueryClient
     from azure.identity import DefaultAzureCredential
 except Exception:
@@ -35,11 +36,11 @@ except Exception:
     LogsQueryClient = None
     DefaultAzureCredential = None
     LoggingInstrumentor = None
+    otel_trace = None
 from pydantic import BaseModel, Field
 import anthropic
 import openai
 from openai import OpenAI, AzureOpenAI
-from tavily import TavilyClient
 
 app = FastAPI(title="Researcher API", version="0.1.0")
 
@@ -98,6 +99,24 @@ import logging
 telemetry_logger = logging.getLogger("researcher.telemetry")
 telemetry_logger.setLevel(logging.INFO)
 
+# OpenTelemetry tracer for custom pipeline spans
+_tracer = otel_trace.get_tracer("researcher.pipeline") if otel_trace else None
+
+def _start_span(name: str, attributes: dict = None):
+    """Start an OpenTelemetry span if tracing is available."""
+    if _tracer:
+        span = _tracer.start_span(name, attributes=attributes or {})
+        return span
+    return None
+
+def _end_span(span, attributes: dict = None):
+    """End a span, optionally adding final attributes."""
+    if span:
+        if attributes:
+            for k, v in attributes.items():
+                span.set_attribute(k, v)
+        span.end()
+
 def _emit_run_event(run_summary: Dict[str, Any]):
     """Emit a durable run summary into App Insights via logs.
 
@@ -135,7 +154,7 @@ app.add_middleware(
 # Initialize clients
 anthropic_client = None
 openai_client = None
-tavily_client = None
+
 
 def get_anthropic_client():
     global anthropic_client
@@ -173,14 +192,7 @@ def get_openai_client():
 # Flag indicating whether we're running against Azure OpenAI
 _is_azure = bool(os.getenv("AZURE_OPENAI_ENDPOINT"))
 
-def get_tavily_client():
-    global tavily_client
-    if tavily_client is None:
-        api_key = os.getenv("TAVILY_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=503, detail="TAVILY_API_KEY not configured")
-        tavily_client = TavilyClient(api_key=api_key)
-    return tavily_client
+
 
 
 def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_sources: int = 6) -> List[Dict[str, Any]]:
@@ -193,6 +205,7 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
     """
 
     client = get_openai_client()
+    search_start = time.time()
 
     # Azure OpenAI requires 'web_search_preview'; standard OpenAI uses 'web_search'
     search_tool_type = "web_search_preview" if _is_azure else "web_search"
@@ -244,6 +257,8 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
                                 "raw_content": "",
                             })
 
+    search_elapsed_ms = int((time.time() - search_start) * 1000)
+
     # Return the LLM's analysis text as a synthetic source, plus individual sources
     if message_text:
         result = [{
@@ -256,8 +271,21 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
         for s in sources[:max_sources]:
             if s["url"] != result[0]["url"]:
                 result.append(s)
+        telemetry_logger.info(
+            "web_search_complete query=%s duration_ms=%d sources=%d is_azure=%s",
+            query[:60], search_elapsed_ms, len(sources), _is_azure,
+        )
+        span = _start_span("openai_web_search", {
+            "search.query": query[:100], "search.duration_ms": search_elapsed_ms,
+            "search.source_count": len(sources), "search.is_azure": _is_azure,
+        })
+        _end_span(span)
         return result
 
+    telemetry_logger.info(
+        "web_search_complete query=%s duration_ms=%d sources=%d is_azure=%s (no_message)",
+        query[:60], search_elapsed_ms, len(sources), _is_azure,
+    )
     return sources[:max_sources]
 
 
@@ -306,12 +334,6 @@ async def debug_web_search(request: Request, q: str = "new look fashion UK 2025"
         return {"error": str(e)}
 
 
-# Eagerly initialize Tavily at startup to catch config errors early
-try:
-    get_tavily_client()
-    print("✓ Tavily client initialized")
-except Exception as e:
-    print(f"⚠ Tavily initialization failed: {e}")
 
 # LLM Configuration
 DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "anthropic")
@@ -322,8 +344,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 class ResearchRequest(BaseModel):
     question: str
     provider: Optional[str] = Field(default=None, description="LLM provider: 'anthropic' or 'openai'. Uses DEFAULT_LLM_PROVIDER env var if not specified.")
-    # Search backend is only honored when provider=='openai' (per product decision).
-    search_backend: Optional[str] = Field(default=None, description="Web search backend. For provider=openai: 'tavily' (default) or 'openai' (Responses web_search). Ignored for anthropic.")
+    # search_backend kept for backward compat but always uses OpenAI web search
+    search_backend: Optional[str] = Field(default=None, description="Deprecated. OpenAI web search is always used.")
     system_prompt: Optional[str] = Field(default=None, description="Optional system prompt prepended to all LLM calls for this request.")
     max_hypotheses_per_category: Optional[int] = Field(default=None, ge=1, le=10, description="Max hypotheses per category (market/brand/competitive). Default: 4.")
 
@@ -344,8 +366,8 @@ class ResearchResponse(BaseModel):
     # Telemetry
     run_id: Optional[str] = None
     latency_ms: Optional[int] = None
-    tavily_searches: Optional[int] = None
-    tavily_second_passes: Optional[int] = None
+    web_searches: Optional[int] = None
+    web_search_retries: Optional[int] = None
     llm_calls: Optional[int] = None
     tokens_in: Optional[int] = None
     tokens_out: Optional[int] = None
@@ -582,8 +604,8 @@ AppTraces
 | summarize
     runs=count(),
     tokens_total=sum(tolong(run.tokens_total)),
-    tavily_searches=sum(tolong(run.tavily_searches)),
-    tavily_second_passes=sum(tolong(run.tavily_second_passes))
+    web_searches=sum(tolong(run.web_searches)),
+    web_search_retries=sum(tolong(run.web_search_retries))
 """
         try:
             resp = client.query_workspace(ws, query)
@@ -595,8 +617,8 @@ AppTraces
                     "p50_latency_ms": None,
                     "p95_latency_ms": None,
                     "tokens_total": int(r[1] or 0),
-                    "tavily_searches": int(r[2] or 0),
-                    "tavily_second_passes": int(r[3] or 0),
+                    "web_searches": int(r[2] or 0),
+                    "web_search_retries": int(r[3] or 0),
                     "providers": {},
                 }
         except Exception:
@@ -611,8 +633,8 @@ AppTraces
             "p50_latency_ms": None,
             "p95_latency_ms": None,
             "tokens_total": 0,
-            "tavily_searches": 0,
-            "tavily_second_passes": 0,
+            "web_searches": 0,
+            "web_search_retries": 0,
             "providers": {},
         }
 
@@ -635,8 +657,8 @@ AppTraces
         "p50_latency_ms": pct(50),
         "p95_latency_ms": pct(95),
         "tokens_total": sum(int(i.get("tokens_total", 0) or 0) for i in items),
-        "tavily_searches": sum(int(i.get("tavily_searches", 0) or 0) for i in items),
-        "tavily_second_passes": sum(int(i.get("tavily_second_passes", 0) or 0) for i in items),
+        "web_searches": sum(int(i.get("web_searches", 0) or 0) for i in items),
+        "web_search_retries": sum(int(i.get("web_search_retries", 0) or 0) for i in items),
         "providers": providers,
     }
 
@@ -768,7 +790,7 @@ def eval_run(payload: dict = Body(...)):
                 "score": score,
                 "latency_ms": resp.get("latency_ms"),
                 "tokens_total": resp.get("tokens_total"),
-                "tavily_searches": resp.get("tavily_searches"),
+                "web_searches": resp.get("web_searches"),
                 "validated_counts": (resp.get("validated_counts") or resp.get("summary")),
                 "timestamp": datetime.now().isoformat(),
             }
@@ -799,10 +821,10 @@ def research(req: ResearchRequest):
             "run_id": run_id,
             "provider": provider,
             "question": req.question,
-            "search_backend": req.search_backend or "tavily",
+            "search_backend": "openai",
             "started_at": datetime.now().isoformat(),
-            "tavily_searches": 0,
-            "tavily_second_passes": 0,
+            "web_searches": 0,
+            "web_search_retries": 0,
             "llm_calls": 0,
             "tokens_in": 0,
             "tokens_out": 0,
@@ -823,8 +845,8 @@ def research(req: ResearchRequest):
                     "question": req.question,
                     "brand": None,
                     "time_period": None,
-                    "tavily_searches": 0,
-                    "tavily_second_passes": 0,
+                    "web_searches": 0,
+                    "web_search_retries": 0,
                     "llm_calls": int((_run_ctx.get() or {}).get("llm_calls", 0) or 0),
                     "tokens_in": int((_run_ctx.get() or {}).get("tokens_in", 0) or 0),
                     "tokens_out": int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
@@ -846,8 +868,8 @@ def research(req: ResearchRequest):
                 coaching=help_payload,
                 run_id=run_id,
                 latency_ms=latency_ms,
-                tavily_searches=0,
-                tavily_second_passes=0,
+                web_searches=0,
+                web_search_retries=0,
                 llm_calls=int((_run_ctx.get() or {}).get("llm_calls", 0) or 0),
                 tokens_in=int((_run_ctx.get() or {}).get("tokens_in", 0) or 0),
                 tokens_out=int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
@@ -872,8 +894,8 @@ def research(req: ResearchRequest):
                 "question": req.question,
                 "brand": brand_guess,
                 "time_period": None,
-                "tavily_searches": 0,
-                "tavily_second_passes": 0,
+                "web_searches": 0,
+                "web_search_retries": 0,
                 "llm_calls": int((_run_ctx.get() or {}).get("llm_calls", 0) or 0),
                 "tokens_in": int((_run_ctx.get() or {}).get("tokens_in", 0) or 0),
                 "tokens_out": int((_run_ctx.get() or {}).get("tokens_out", 0) or 0),
@@ -897,8 +919,8 @@ def research(req: ResearchRequest):
                 coaching=coaching,
                 run_id=run_id,
                 latency_ms=latency_ms,
-                tavily_searches=0,
-                tavily_second_passes=0,
+                web_searches=0,
+                web_search_retries=0,
                 llm_calls=run_summary["llm_calls"],
                 tokens_in=run_summary["tokens_in"],
                 tokens_out=run_summary["tokens_out"],
@@ -916,8 +938,8 @@ def research(req: ResearchRequest):
         
         # Step 4: Process hypotheses in parallel (search + validate)
         validated, meta = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
-        _run_metric_set("tavily_searches", int(meta.get("tavily_searches", 0) or 0))
-        _run_metric_set("tavily_second_passes", int(meta.get("tavily_second_passes", 0) or 0))
+        _run_metric_set("web_searches", int(meta.get("web_searches", 0) or 0))
+        _run_metric_set("web_search_retries", int(meta.get("web_search_retries", 0) or 0))
         
         # Step 5: Build summary
         summary = build_summary(validated)
@@ -949,8 +971,8 @@ def research(req: ResearchRequest):
             "question": req.question,
             "brand": parsed.get("brand"),
             "time_period": parsed.get("time_period"),
-            "tavily_searches": int(meta.get("tavily_searches", 0) or 0),
-            "tavily_second_passes": int(meta.get("tavily_second_passes", 0) or 0),
+            "web_searches": int(meta.get("web_searches", 0) or 0),
+            "web_search_retries": int(meta.get("web_search_retries", 0) or 0),
             "llm_calls": int(ctx.get("llm_calls", 0) or 0),
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
@@ -976,8 +998,8 @@ def research(req: ResearchRequest):
             summary=summary,
             run_id=run_id,
             latency_ms=latency_ms,
-            tavily_searches=int(meta.get("tavily_searches", 0) or 0),
-            tavily_second_passes=int(meta.get("tavily_second_passes", 0) or 0),
+            web_searches=int(meta.get("web_searches", 0) or 0),
+            web_search_retries=int(meta.get("web_search_retries", 0) or 0),
             llm_calls=run_summary["llm_calls"],
             tokens_in=tokens_in,
             tokens_out=tokens_out,
@@ -1027,8 +1049,8 @@ def research_stream(req: ResearchRequest):
                 "provider": provider,
                 "question": req.question,
                 "started_at": started_at.isoformat(),
-                "tavily_searches": 0,
-                "tavily_second_passes": 0,
+                "web_searches": 0,
+                "web_search_retries": 0,
                 "llm_calls": 0,
                 "tokens_in": 0,
                 "tokens_out": 0,
@@ -1076,7 +1098,12 @@ def research_stream(req: ResearchRequest):
             return
 
         # Step 1: Parse question
+        step1_start = time.time()
         parsed = parse_question(req.question, provider=provider)
+        step1_ms = int((time.time() - step1_start) * 1000)
+        telemetry_logger.info("pipeline_step step=parse_question duration_ms=%d brand=%s", step1_ms, parsed.get("brand"))
+        span = _start_span("pipeline.parse_question", {"step.duration_ms": step1_ms, "step.brand": parsed.get("brand", "")})
+        _end_span(span)
         yield sse("parsed", parsed)
 
         # Step 2: Get competitors
@@ -1084,13 +1111,16 @@ def research_stream(req: ResearchRequest):
         yield sse("competitors", {"competitors": competitors})
 
         # Step 3: Generate hypotheses
+        step3_start = time.time()
         hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
+        step3_ms = int((time.time() - step3_start) * 1000)
+        total_hyps = sum(len(hypotheses.get(c, []) or []) for c in ["market", "brand", "competitive"])
+        telemetry_logger.info("pipeline_step step=generate_hypotheses duration_ms=%d hypothesis_count=%d", step3_ms, total_hyps)
+        span = _start_span("pipeline.generate_hypotheses", {"step.duration_ms": step3_ms, "step.hypothesis_count": total_hyps})
+        _end_span(span)
         yield sse("hypotheses", hypotheses)
 
         # Step 4: Process hypotheses in parallel and stream results
-        search_backend = (req.search_backend or "tavily").lower()
-        use_openai_search = (provider == "openai" and search_backend == "openai")
-        tavily = None if use_openai_search else get_tavily_client()
         tasks: List[tuple[Dict, str]] = []
         for cat in ["market", "brand", "competitive"]:
             for hyp in hypotheses.get(cat, []) or []:
@@ -1106,47 +1136,37 @@ def research_stream(req: ResearchRequest):
             return " ".join([original, brand, tp, region, "retail"]).strip()
 
         def process_one(hyp: Dict, cat: str) -> Dict:
+            hyp_start = time.time()
             query = hyp.get("search_query") or hyp.get("hypothesis") or ""
             if not query:
                 return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
 
-            # Pass 1
-            if use_openai_search:
-                try:
-                    r1 = openai_web_search(query)
-                except Exception as e:
-                    print(f"OpenAI web_search error for '{query[:30]}...': {e}")
-                    r1 = []
-            else:
-                _run_metric_incr("tavily_searches", 1)
-                sr1 = tavily.search(
-                    query=query,
-                    search_depth="basic",
-                    max_results=3,
-                    include_raw_content=True,
-                )
-                r1 = sr1.get("results", []) or []
+            # Pass 1: Web search
+            _run_metric_incr("web_searches", 1)
+            try:
+                r1 = openai_web_search(query)
+            except Exception as e:
+                print(f"Web search error for '{query[:30]}...': {e}")
+                r1 = []
             validation = {"validated": False, "evidence": ""}
             if r1:
                 validation = validate_hypothesis(hyp, r1, provider=provider)
 
-            # Option A second pass when weak
+            # Second pass: retry with refined query when weak results
             second_pass_used = False
             second_query = None
-            if (not use_openai_search) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
+            if ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
                 q2 = refine_query(query)
                 if q2 and q2 != query:
                     second_pass_used = True
                     second_query = q2
-                    _run_metric_incr("tavily_searches", 1)
-                    _run_metric_incr("tavily_second_passes", 1)
-                    sr2 = tavily.search(
-                        query=q2,
-                        search_depth="basic",
-                        max_results=3,
-                        include_raw_content=True,
-                    )
-                    r2 = sr2.get("results", []) or []
+                    _run_metric_incr("web_searches", 1)
+                    _run_metric_incr("web_search_retries", 1)
+                    try:
+                        r2 = openai_web_search(q2)
+                    except Exception as e:
+                        print(f"Web search second pass error: {e}")
+                        r2 = []
                     combined = (r1 + r2)[:4]
                     if combined:
                         validation2 = validate_hypothesis(hyp, combined, provider=provider)
@@ -1168,6 +1188,7 @@ def research_stream(req: ResearchRequest):
                 "result_count": len(r1),
             }
 
+        step4_start = time.time()
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_task = {executor.submit(process_one, hyp, cat): (hyp, cat) for hyp, cat in tasks}
             completed = 0
@@ -1202,9 +1223,25 @@ def research_stream(req: ResearchRequest):
                         "total": len(tasks),
                     },
                 )
+        step4_ms = int((time.time() - step4_start) * 1000)
+        validated_count = sum(len(v) for v in validated.values())
+        telemetry_logger.info(
+            "pipeline_step step=parallel_search duration_ms=%d hypotheses=%d validated=%d workers=5",
+            step4_ms, len(tasks), validated_count,
+        )
+        span = _start_span("pipeline.parallel_search", {
+            "step.duration_ms": step4_ms, "step.hypothesis_count": len(tasks),
+            "step.validated_count": validated_count, "step.workers": 5,
+        })
+        _end_span(span)
 
         # Step 5: Build summary + final response
+        step5_start = time.time()
         summary = build_summary(validated)
+        step5_ms = int((time.time() - step5_start) * 1000)
+        telemetry_logger.info("pipeline_step step=build_summary duration_ms=%d", step5_ms)
+        span = _start_span("pipeline.build_summary", {"step.duration_ms": step5_ms})
+        _end_span(span)
 
         metric_val = parsed.get("metric", "salient")
         if isinstance(metric_val, str):
@@ -1228,8 +1265,8 @@ def research_stream(req: ResearchRequest):
             "question": req.question,
             "brand": parsed.get("brand"),
             "time_period": parsed.get("time_period"),
-            "tavily_searches": int(ctx.get("tavily_searches", 0) or 0),
-            "tavily_second_passes": int(ctx.get("tavily_second_passes", 0) or 0),
+            "web_searches": int(ctx.get("web_searches", 0) or 0),
+            "web_search_retries": int(ctx.get("web_search_retries", 0) or 0),
             "llm_calls": int(ctx.get("llm_calls", 0) or 0),
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
@@ -1255,8 +1292,8 @@ def research_stream(req: ResearchRequest):
             "summary": summary,
             "run_id": run_id,
             "latency_ms": latency_ms,
-            "tavily_searches": run_summary["tavily_searches"],
-            "tavily_second_passes": run_summary["tavily_second_passes"],
+            "web_searches": run_summary["web_searches"],
+            "web_search_retries": run_summary["web_search_retries"],
             "llm_calls": run_summary["llm_calls"],
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
@@ -1413,14 +1450,10 @@ def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional
 def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None) -> tuple[Dict[str, List[Dict]], Dict[str, int]]:
     """Process each hypothesis: search + validate in parallel.
 
-    Implements a targeted second-pass search (Option A) when the first pass is weak.
+    Implements a targeted second-pass search when the first pass is weak.
     """
 
     eval_mode = bool(_eval_mode.get() or False)
-    ctx = _run_ctx.get() or {}
-    search_backend = (ctx.get("search_backend") or "tavily").lower()
-    # debug
-    print(f"Search backend: {search_backend} (provider={provider})")
 
     if eval_mode:
         # Cheaper/faster settings for eval runs to avoid burning tokens/time.
@@ -1433,8 +1466,8 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
     results = {"market": [], "brand": [], "competitive": []}
     errors = []
 
-    tavily_searches_total = 0
-    tavily_second_passes_total = 0
+    web_searches_total = 0
+    web_search_retries_total = 0
 
     all_tasks = []
     for cat in ["market", "brand", "competitive"]:
@@ -1443,13 +1476,7 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
     print(f"Processing {len(all_tasks)} hypotheses...")
 
-    tavily = None
-    use_openai_search = (provider == "openai" and search_backend == "openai")
-    if not use_openai_search:
-        tavily = get_tavily_client()
-
     def refine_query(original: str) -> str:
-        # Cheap, deterministic refinement (no extra LLM calls)
         brand = parsed.get("brand") or ""
         tp = parsed.get("time_period") or ""
         region = "UK" if "uk" not in original.lower() else ""
@@ -1458,28 +1485,20 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
     def process_one(hyp, cat):
         query = hyp.get("search_query", hyp.get("hypothesis", ""))
         if not query:
-            return {"category": cat, "_tavily_searches": 0, "_tavily_second_passes": 0}
+            return {"category": cat, "_web_searches": 0, "_web_search_retries": 0}
 
         local_searches = 0
         local_second = 0
 
         try:
-            # Pass 1
+            # Pass 1: Web search
             print(f"Searching: {query[:50]}...")
-            if use_openai_search:
-                try:
-                    r1 = openai_web_search(query)
-                except Exception as e:
-                    print(f"OpenAI web_search error for '{query[:30]}...': {e}")
-                    r1 = []
-            else:
-                sr1 = tavily.search(
-                    query=query,
-                    search_depth="basic",
-                    max_results=2 if eval_mode else 3,
-                    include_raw_content=False if eval_mode else True,
-                )
-                r1 = (sr1 or {}).get("results", []) or []
+            local_searches += 1
+            try:
+                r1 = openai_web_search(query)
+            except Exception as e:
+                print(f"Web search error for '{query[:30]}...': {e}")
+                r1 = []
             print(f"Found {len(r1)} results for: {query[:30]}...")
 
             validation = {"validated": False, "evidence": ""}
@@ -1487,22 +1506,20 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
                 validation = validate_hypothesis(hyp, r1, provider=provider)
                 print(f"Validation: {validation.get('validated')} - {validation.get('evidence', '')[:50]}...")
 
-            # Option A: targeted second-pass when weak
+            # Second pass: targeted retry when weak
             second_pass_used = False
-            if (not eval_mode) and (not use_openai_search) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
+            if (not eval_mode) and ((not r1) or (len(r1) < 2) or (not validation.get("validated"))):
                 q2 = refine_query(query)
                 if q2 and q2 != query:
                     second_pass_used = True
                     local_searches += 1
                     local_second += 1
                     print(f"2nd-pass search: {q2[:60]}...")
-                    sr2 = tavily.search(
-                        query=q2,
-                        search_depth="basic",
-                        max_results=3,
-                        include_raw_content=True,
-                    )
-                    r2 = sr2.get("results", []) or []
+                    try:
+                        r2 = openai_web_search(q2)
+                    except Exception as e:
+                        print(f"Web search second pass error: {e}")
+                        r2 = []
                     combined = (r1 + r2)[:4]
                     if combined:
                         validation2 = validate_hypothesis(hyp, combined, provider=provider)
@@ -1513,8 +1530,8 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             if r1 and validation.get("validated"):
                 return {
                     "category": cat,
-                    "_tavily_searches": local_searches,
-                    "_tavily_second_passes": local_second,
+                    "_web_searches": local_searches,
+                    "_web_search_retries": local_second,
                     "item": {
                         "status": "VALIDATED",
                         "hypothesis": hyp.get("hypothesis"),
@@ -1525,13 +1542,13 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
                     },
                 }
 
-            return {"category": cat, "_tavily_searches": local_searches, "_tavily_second_passes": local_second}
+            return {"category": cat, "_web_searches": local_searches, "_web_search_retries": local_second}
 
         except Exception as e:
-            error_msg = f"Tavily error for '{query[:30]}...': {str(e)}"
+            error_msg = f"Search error for '{query[:30]}...': {str(e)}"
             print(error_msg)
             errors.append(error_msg)
-            return {"category": cat, "_tavily_searches": local_searches, "_tavily_second_passes": local_second, "error": str(e)}
+            return {"category": cat, "_web_searches": local_searches, "_web_search_retries": local_second, "error": str(e)}
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_task = {executor.submit(process_one, hyp, cat): (hyp, cat) for hyp, cat in all_tasks}
@@ -1541,13 +1558,13 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             try:
                 result = future.result() or {}
 
-                tavily_searches_total_nonlocal = int(result.get("_tavily_searches", 0) or 0)
-                tavily_second_passes_total_nonlocal = int(result.get("_tavily_second_passes", 0) or 0)
+                web_searches_total_nonlocal = int(result.get("_web_searches", 0) or 0)
+                web_search_retries_total_nonlocal = int(result.get("_web_search_retries", 0) or 0)
                 nonlocal_err = result.get("error")
 
                 # aggregate counts in main thread (contextvars don't propagate to threads)
-                tavily_searches_total += tavily_searches_total_nonlocal
-                tavily_second_passes_total += tavily_second_passes_total_nonlocal
+                web_searches_total += web_searches_total_nonlocal
+                web_search_retries_total += web_search_retries_total_nonlocal
 
                 if result.get("item") and not nonlocal_err:
                     results[result.get("category", cat)].append(result["item"])
@@ -1559,17 +1576,19 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
         print(f"Errors encountered: {len(errors)}")
     
     meta = {
-        "tavily_searches": tavily_searches_total,
-        "tavily_second_passes": tavily_second_passes_total,
+        "web_searches": web_searches_total,
+        "web_search_retries": web_search_retries_total,
     }
     return results, meta
 
 def validate_hypothesis(hypothesis: Dict, search_results: List[Dict], provider: Optional[str] = None) -> Dict:
     """Use LLM to validate if search results support the hypothesis"""
     
+    # For web search analysis sources (Azure OpenAI), content can be longer and more valuable
+    # Use more chars for analysis sources vs regular search results
     search_text = "\n\n".join([
-        f"Title: {r.get('title', '')}\nContent: {r.get('raw_content', r.get('content', ''))[:500]}"
-        for r in search_results[:2]
+        f"Title: {r.get('title', '')}\nContent: {r.get('raw_content', r.get('content', ''))[:1500]}"
+        for r in search_results[:3]
     ])
     
     prompt = f"""Hypothesis: {hypothesis.get('hypothesis')}
