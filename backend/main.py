@@ -151,6 +151,240 @@ app.add_middleware(
     max_age=3600,
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TRUSTED SOURCES CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_TRUSTED_SOURCES = [
+    # Top tier 'Trusted' sources — news & wire services
+    {"domain": "reuters.com", "name": "Reuters", "trust_score": 10, "tier": "trusted"},
+    {"domain": "bloomberg.com", "name": "Bloomberg", "trust_score": 10, "tier": "trusted"},
+    {"domain": "ft.com", "name": "Financial Times", "trust_score": 10, "tier": "trusted"},
+    {"domain": "wsj.com", "name": "The Wall Street Journal", "trust_score": 10, "tier": "trusted"},
+    # Advertising & marketing trade press
+    {"domain": "adweek.com", "name": "Adweek", "trust_score": 9, "tier": "trusted"},
+    {"domain": "adage.com", "name": "Ad Age", "trust_score": 9, "tier": "trusted"},
+    {"domain": "thedrum.com", "name": "The Drum", "trust_score": 9, "tier": "trusted"},
+    {"domain": "campaignlive.co.uk", "name": "Campaign", "trust_score": 9, "tier": "trusted"},
+    {"domain": "campaignlive.com", "name": "Campaign", "trust_score": 9, "tier": "trusted"},
+    {"domain": "marketingweek.com", "name": "Marketing Week", "trust_score": 9, "tier": "trusted"},
+    # Research & intelligence
+    {"domain": "kantar.com", "name": "Kantar", "trust_score": 10, "tier": "trusted"},
+    {"domain": "mckinsey.com", "name": "McKinsey", "trust_score": 9, "tier": "trusted"},
+    {"domain": "mintel.com", "name": "Mintel", "trust_score": 9, "tier": "trusted"},
+    {"domain": "euromonitor.com", "name": "Euromonitor", "trust_score": 9, "tier": "trusted"},
+    # Reputable business news (secondary tier)
+    {"domain": "cnbc.com", "name": "CNBC", "trust_score": 8, "tier": "reputable"},
+    {"domain": "bbc.com", "name": "BBC", "trust_score": 8, "tier": "reputable"},
+    {"domain": "bbc.co.uk", "name": "BBC", "trust_score": 8, "tier": "reputable"},
+    {"domain": "theguardian.com", "name": "The Guardian", "trust_score": 8, "tier": "reputable"},
+    {"domain": "nytimes.com", "name": "New York Times", "trust_score": 8, "tier": "reputable"},
+    {"domain": "forbes.com", "name": "Forbes", "trust_score": 7, "tier": "reputable"},
+    {"domain": "businessinsider.com", "name": "Business Insider", "trust_score": 7, "tier": "reputable"},
+    {"domain": "marketingdive.com", "name": "Marketing Dive", "trust_score": 8, "tier": "reputable"},
+    {"domain": "wwd.com", "name": "WWD", "trust_score": 8, "tier": "reputable"},
+    {"domain": "yahoo.com", "name": "Yahoo Finance", "trust_score": 7, "tier": "reputable"},
+]
+
+# Social media domains — must be EXCLUDED from results (POC requirement)
+SOCIAL_MEDIA_DOMAINS = [
+    "twitter.com", "x.com",
+    "tiktok.com",
+    "instagram.com",
+    "facebook.com", "fb.com",
+    "reddit.com",
+    "threads.net",
+    "linkedin.com",
+    "pinterest.com",
+    "snapchat.com",
+    "youtube.com",
+    "youtu.be",
+]
+
+# Mutable server-side source config (overridable via /sources PUT)
+_trusted_sources = list(DEFAULT_TRUSTED_SOURCES)
+
+
+def _get_domain(url: str) -> str:
+    """Extract root domain from URL (e.g. 'https://www.reuters.com/article/...' -> 'reuters.com')."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        if host.startswith("www."):
+            host = host[4:]
+        return host.lower()
+    except Exception:
+        return ""
+
+
+def _is_social_media(url: str) -> bool:
+    """Check if URL is from a social media platform."""
+    domain = _get_domain(url)
+    return any(domain == sm or domain.endswith("." + sm) for sm in SOCIAL_MEDIA_DOMAINS)
+
+
+def _score_source(url: str, trusted_sources: List[Dict] = None) -> Dict:
+    """Score a source URL against the trusted sources list.
+    Returns {trust_score, tier, source_name, is_trusted}
+    """
+    sources = trusted_sources or _trusted_sources
+    domain = _get_domain(url)
+    for src in sources:
+        src_domain = src["domain"].lower()
+        if domain == src_domain or domain.endswith("." + src_domain):
+            return {
+                "trust_score": src.get("trust_score", 5),
+                "tier": src.get("tier", "unknown"),
+                "source_name": src.get("name", domain),
+                "is_trusted": True,
+            }
+    return {
+        "trust_score": 3,
+        "tier": "unverified",
+        "source_name": domain,
+        "is_trusted": False,
+    }
+
+
+@app.get("/sources")
+async def get_sources(request: Request):
+    """Return the current trusted sources list and social media blocklist."""
+    return {
+        "trusted_sources": _trusted_sources,
+        "social_media_blocked": SOCIAL_MEDIA_DOMAINS,
+        "total_trusted": len(_trusted_sources),
+    }
+
+
+@app.put("/sources")
+async def update_sources(request: Request):
+    """Update the trusted sources list. Body: {trusted_sources: [...]}"""
+    global _trusted_sources
+    body = await request.json()
+    new_sources = body.get("trusted_sources")
+    if new_sources is None:
+        raise HTTPException(status_code=400, detail="Missing 'trusted_sources' in body")
+    if not isinstance(new_sources, list):
+        raise HTTPException(status_code=400, detail="'trusted_sources' must be a list")
+    # Validate each source has required fields
+    for i, src in enumerate(new_sources):
+        if not isinstance(src, dict) or "domain" not in src:
+            raise HTTPException(status_code=400, detail=f"Source at index {i} missing 'domain' field")
+        src.setdefault("name", src["domain"])
+        src.setdefault("trust_score", 5)
+        src.setdefault("tier", "custom")
+    _trusted_sources = new_sources
+    return {"status": "updated", "total_trusted": len(_trusted_sources)}
+
+
+@app.post("/sources/reset")
+async def reset_sources(request: Request):
+    """Reset trusted sources to defaults."""
+    global _trusted_sources
+    _trusted_sources = list(DEFAULT_TRUSTED_SOURCES)
+    return {"status": "reset", "total_trusted": len(_trusted_sources)}
+
+
+# ── SERVER-SIDE CONFIG ──────────────────────────────────────────────────────
+
+_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+
+DEFAULT_CONFIG = {
+    "systemPrompt": (
+        "You are a research analyst specialising in brand tracking and consumer sentiment analysis.\n\n"
+        "Your role:\n"
+        "- Analyse why brand metrics (especially Salience / mental availability) change over time.\n"
+        "- Generate hypotheses about market, brand-specific, and competitive factors.\n"
+        "- Validate hypotheses with web evidence and provide cited sources.\n\n"
+        "Guidelines:\n"
+        "- Be specific: reference real events, campaigns, product launches, market shifts.\n"
+        "- Be evidence-based: only report findings backed by credible web sources.\n"
+        "- Be concise: use bullet points and structured output.\n"
+        "- Tailor your analysis to the brand's specific industry and market context.\n"
+        "- Always include the time period in search queries to get relevant results."
+    ),
+    "hypothesisPrompt": (
+        "When generating hypotheses, follow these rules:\n\n"
+        "INDUSTRY CONTEXT:\n"
+        "- First determine the brand's industry (e.g. automotive, fashion, technology, FMCG).\n"
+        "- ALL hypotheses must be relevant to the brand's actual industry.\n"
+        "- Do NOT include trends, competitors, or events from unrelated industries.\n\n"
+        "MARKET HYPOTHESES (macro trends):\n"
+        "- Economic conditions: consumer spending, inflation, interest rates, currency shifts.\n"
+        "- Industry-specific disruptions: regulation, technology shifts, supply chain events.\n"
+        "- Consumer behaviour changes: purchasing patterns, demographics, sentiment.\n"
+        "- Political, trade, or environmental factors affecting the brand's sector.\n\n"
+        "BRAND HYPOTHESES (brand's own actions):\n"
+        "- Each must reference a SPECIFIC action, person, product, campaign, or event.\n"
+        "- Include: product launches/recalls, leadership changes, PR events, controversies.\n"
+        "- Include: store/facility openings or closures, pricing changes, strategy shifts.\n"
+        "- Avoid generic statements like 'brand improved marketing' — name the campaign.\n\n"
+        "COMPETITIVE HYPOTHESES:\n"
+        "- Each must name a SPECIFIC competitor from the brand's actual industry.\n"
+        "- Competitors must operate in the SAME market — never cross-industry.\n"
+        "- Include specific actions: campaigns, product launches, pricing moves, expansions.\n"
+        "- Each hypothesis should focus on a DIFFERENT competitor.\n\n"
+        "SEARCH QUERIES:\n"
+        "- search_query: specific and targeted (include brand/competitor name + time period).\n"
+        "- search_query_broad: broader fallback (include brand/competitor name + time period).\n\n"
+        "QUALITY CHECK:\n"
+        "- Before finalising, review each hypothesis for relevance to the brand and its industry.\n"
+        "- Remove anything that a domain expert would consider irrelevant or nonsensical."
+    ),
+    "maxHypothesesPerCategory": 4,
+    "minVerifiedSourcePct": 25,
+}
+
+def _load_config() -> dict:
+    """Load config from disk or return defaults."""
+    try:
+        if os.path.exists(_CONFIG_FILE):
+            with open(_CONFIG_FILE, "r") as f:
+                stored = json.load(f)
+            # Merge with defaults so new keys are always present
+            merged = {**DEFAULT_CONFIG, **stored}
+            return merged
+    except Exception as e:
+        print(f"Config load error: {e}")
+    return dict(DEFAULT_CONFIG)
+
+def _save_config(cfg: dict):
+    """Persist config to disk."""
+    try:
+        with open(_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Config save error: {e}")
+
+# In-memory config, loaded at startup
+_app_config: dict = _load_config()
+
+
+@app.get("/config")
+async def get_config(request: Request):
+    """Return server-side app config."""
+    return _app_config
+
+
+@app.put("/config")
+async def update_config(request: Request):
+    """Update server-side app config. Body: JSON with any config keys."""
+    global _app_config
+    body = await request.json()
+    _app_config.update(body)
+    _save_config(_app_config)
+    return {"status": "updated", "config": _app_config}
+
+
+@app.post("/config/reset")
+async def reset_config(request: Request):
+    """Reset config to defaults."""
+    global _app_config
+    _app_config = dict(DEFAULT_CONFIG)
+    _save_config(_app_config)
+    return {"status": "reset", "config": _app_config}
+
+
 # Initialize clients
 anthropic_client = None
 openai_client = None
@@ -195,7 +429,7 @@ _is_azure = bool(os.getenv("AZURE_OPENAI_ENDPOINT"))
 
 
 
-def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_sources: int = 6) -> List[Dict[str, Any]]:
+def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_sources: int = 6, model_override: Optional[str] = None, trusted_sources: Optional[List[Dict]] = None) -> List[Dict[str, Any]]:
     """Use OpenAI Responses API web_search tool to retrieve web sources.
 
     Returns a list of dicts compatible with our existing pipeline:
@@ -214,20 +448,30 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
         tool_config["user_location"] = user_location
     tools: List[Dict[str, Any]] = [tool_config]
 
+    search_model = model_override or os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL)
+
     # Retry with exponential backoff for 429 rate-limit errors
     max_retries = 3
     resp = None
+    # Some models (e.g. gpt-5-mini) don't support temperature
+    use_temperature = "gpt-5" not in search_model
     for attempt in range(max_retries + 1):
         try:
-            resp = client.responses.create(
-                model=os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL),
+            create_kwargs = dict(
+                model=search_model,
                 tools=tools,
-                temperature=0,
                 include=["web_search_call.action.sources"],
                 input=query,
             )
+            if use_temperature:
+                create_kwargs["temperature"] = 0
+            resp = client.responses.create(**create_kwargs)
             break  # Success
         except Exception as e:
+            if "temperature" in str(e).lower() and use_temperature:
+                # Model doesn't support temperature, retry without it
+                use_temperature = False
+                continue
             if "429" in str(e) and attempt < max_retries:
                 wait_time = 2 ** (attempt + 1)  # 2s, 4s, 8s
                 print(f"Rate limited (429) on attempt {attempt+1}, retrying in {wait_time}s: {query[:40]}...")
@@ -278,19 +522,37 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
 
     # Return the LLM's analysis text as a synthetic source, plus individual sources
     if message_text:
+        # ── Source filtering & scoring ──
+        # 1. Remove social media sources
+        sources = [s for s in sources if not _is_social_media(s.get("url", ""))]
+        # 2. Score remaining sources
+        for s in sources:
+            score_info = _score_source(s.get("url", ""), trusted_sources)
+            s["trust_score"] = score_info["trust_score"]
+            s["tier"] = score_info["tier"]
+            s["source_name"] = score_info["source_name"]
+            s["is_trusted"] = score_info["is_trusted"]
+        # 3. Sort by trust score descending so trusted sources appear first
+        sources.sort(key=lambda s: s.get("trust_score", 0), reverse=True)
+
+        filtered_count = len(sources)
         result = [{
             "title": "Web Search Analysis",
             "url": sources[0]["url"] if sources else "",
             "content": message_text[:6000],
             "raw_content": message_text[:6000],
+            "trust_score": sources[0].get("trust_score", 3) if sources else 3,
+            "tier": sources[0].get("tier", "unverified") if sources else "unverified",
+            "source_name": sources[0].get("source_name", "") if sources else "",
+            "is_trusted": sources[0].get("is_trusted", False) if sources else False,
         }]
         # Also include individual citation sources so the pipeline has URLs
         for s in sources[:max_sources]:
             if s["url"] != result[0]["url"]:
                 result.append(s)
         telemetry_logger.info(
-            "web_search_complete query=%s duration_ms=%d sources=%d is_azure=%s",
-            query[:60], search_elapsed_ms, len(sources), _is_azure,
+            "web_search_complete query=%s duration_ms=%d sources=%d filtered=%d is_azure=%s",
+            query[:60], search_elapsed_ms, len(sources), filtered_count, _is_azure,
         )
         span = _start_span("openai_web_search", {
             "search.query": query[:100], "search.duration_ms": search_elapsed_ms,
@@ -299,6 +561,12 @@ def openai_web_search(query: str, *, user_location: Optional[dict] = None, max_s
         _end_span(span)
         return result
 
+    # No message text — filter and score raw sources
+    sources = [s for s in sources if not _is_social_media(s.get("url", ""))]
+    for s in sources:
+        score_info = _score_source(s.get("url", ""), trusted_sources)
+        s.update(score_info)
+    sources.sort(key=lambda s: s.get("trust_score", 0), reverse=True)
     telemetry_logger.info(
         "web_search_complete query=%s duration_ms=%d sources=%d is_azure=%s (no_message)",
         query[:60], search_elapsed_ms, len(sources), _is_azure,
@@ -365,6 +633,8 @@ class ResearchRequest(BaseModel):
     search_backend: Optional[str] = Field(default=None, description="Deprecated. OpenAI web search is always used.")
     system_prompt: Optional[str] = Field(default=None, description="Optional system prompt prepended to all LLM calls for this request.")
     max_hypotheses_per_category: Optional[int] = Field(default=None, ge=1, le=10, description="Max hypotheses per category (market/brand/competitive). Default: 4.")
+    model: Optional[str] = Field(default=None, description="Azure deployment name to use for web search (e.g. 'gpt-4-1-nano', 'gpt-4-1-mini', 'gpt-4o'). Uses OPENAI_SEARCH_MODEL env var if not specified.")
+    trusted_sources: Optional[List[Dict[str, Any]]] = Field(default=None, description="Optional custom trusted sources list. Each item: {domain, name, trust_score, tier}. Uses server default if not specified.")
 
 class ResearchResponse(BaseModel):
     question: str
@@ -398,9 +668,15 @@ _run_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar("run_c
 _eval_mode: contextvars.ContextVar[bool] = contextvars.ContextVar("eval_mode", default=False)
 RUN_LOG: Deque[dict] = deque(maxlen=500)
 
+# Fallback for streaming generators where ContextVar doesn't propagate
+# across yield boundaries in Starlette's threadpool.
+_fallback_metrics: Optional[dict] = None
+
 
 def _run_metric_incr(key: str, amount: int = 1):
     ctx = _run_ctx.get()
+    if not ctx:
+        ctx = _fallback_metrics
     if not ctx:
         return
     ctx[key] = int(ctx.get(key, 0) or 0) + amount
@@ -408,6 +684,8 @@ def _run_metric_incr(key: str, amount: int = 1):
 
 def _run_metric_set(key: str, value: Any):
     ctx = _run_ctx.get()
+    if not ctx:
+        ctx = _fallback_metrics
     if not ctx:
         return
     ctx[key] = value
@@ -570,6 +848,26 @@ COMPETITOR_DB = {
 @app.get("/health")
 def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+
+@app.get("/models")
+def list_models():
+    """Return available Azure OpenAI model deployments."""
+    # These are the deployments we've configured in Azure
+    DEPLOYED_MODELS = [
+        {"deployment": "gpt-4o", "model": "gpt-4o", "version": "2024-08-06", "description": "GPT-4o (Aug 2024) - Original deployment"},
+        {"deployment": "gpt-4o-latest", "model": "gpt-4o", "version": "2024-11-20", "description": "GPT-4o (Nov 2024) - Improved reasoning"},
+        {"deployment": "gpt-4-1", "model": "gpt-4.1", "version": "2025-04-14", "description": "GPT-4.1 - Latest GPT-4 series"},
+        {"deployment": "gpt-4-1-mini", "model": "gpt-4.1-mini", "version": "2025-04-14", "description": "GPT-4.1 Mini - Fast & capable"},
+        {"deployment": "gpt-4-1-nano", "model": "gpt-4.1-nano", "version": "2025-04-14", "description": "GPT-4.1 Nano - Ultra-fast, best validation rate ⭐"},
+        {"deployment": "gpt-5-mini", "model": "gpt-5-mini", "version": "2025-08-07", "description": "GPT-5 Mini - Next-gen compact"},
+        {"deployment": "gpt-5-nano", "model": "gpt-5-nano", "version": "2025-08-07", "description": "GPT-5 Nano - Next-gen ultra-fast"},
+    ]
+    current = os.getenv("OPENAI_SEARCH_MODEL", OPENAI_MODEL)
+    return {
+        "current_default": current,
+        "models": DEPLOYED_MODELS,
+    }
 
 
 @app.get("/telemetry/runs")
@@ -952,10 +1250,10 @@ def research(req: ResearchRequest):
         competitors = COMPETITOR_DB.get(parsed["brand"], [])
         
         # Step 3: Generate hypotheses
-        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 3, system_prompt=req.system_prompt)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
         
-        # Step 4: Process hypotheses in parallel (search + validate)
-        validated, meta = process_hypotheses_parallel(hypotheses, parsed, provider=provider)
+        # Step 4: Process hypotheses (search + validate)
+        validated, meta = process_hypotheses_parallel(hypotheses, parsed, provider=provider, model_override=req.model)
         _run_metric_set("web_searches", int(meta.get("web_searches", 0) or 0))
         _run_metric_set("web_search_retries", int(meta.get("web_search_retries", 0) or 0))
         
@@ -1061,19 +1359,24 @@ def research_stream(req: ResearchRequest):
     def event_gen():
         run_id = str(uuid.uuid4())
         started_at = datetime.now()
-        token = _run_ctx.set(
-            {
-                "run_id": run_id,
-                "provider": provider,
-                "question": req.question,
-                "started_at": started_at.isoformat(),
-                "web_searches": 0,
-                "web_search_retries": 0,
-                "llm_calls": 0,
-                "tokens_in": 0,
-                "tokens_out": 0,
-            }
-        )
+        # Keep a direct reference to the metrics dict so we can read it
+        # even if the ContextVar loses propagation across generator yields
+        # in Starlette's threadpool.
+        run_metrics = {
+            "run_id": run_id,
+            "provider": provider,
+            "question": req.question,
+            "started_at": started_at.isoformat(),
+            "web_searches": 0,
+            "web_search_retries": 0,
+            "llm_calls": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+        }
+        token = _run_ctx.set(run_metrics)
+        # Also set module-level fallback for threadpool context loss
+        global _fallback_metrics
+        _fallback_metrics = run_metrics
 
         yield sse("status", {"stage": "start", "provider": provider, "run_id": run_id})
 
@@ -1130,7 +1433,7 @@ def research_stream(req: ResearchRequest):
 
         # Step 3: Generate hypotheses
         step3_start = time.time()
-        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 3, system_prompt=req.system_prompt)
+        hypotheses = generate_hypotheses(parsed, competitors, provider=provider, max_per_category=req.max_hypotheses_per_category or 4, system_prompt=req.system_prompt)
         step3_ms = int((time.time() - step3_start) * 1000)
         total_hyps = sum(len(hypotheses.get(c, []) or []) for c in ["market", "brand", "competitive"])
         telemetry_logger.info("pipeline_step step=generate_hypotheses duration_ms=%d hypothesis_count=%d", step3_ms, total_hyps)
@@ -1156,13 +1459,14 @@ def research_stream(req: ResearchRequest):
         def process_one(hyp: Dict, cat: str) -> Dict:
             hyp_start = time.time()
             query = hyp.get("search_query") or hyp.get("hypothesis") or ""
+            query_broad = hyp.get("search_query_broad") or ""
             if not query:
                 return {"category": cat, "hypothesis": hyp.get("hypothesis"), "validated": False, "error": "empty_query"}
 
-            # Web search
+            # Web search — try specific query first
             _run_metric_incr("web_searches", 1)
             try:
-                r1 = openai_web_search(query)
+                r1 = openai_web_search(query, model_override=req.model, trusted_sources=req.trusted_sources)
             except Exception as e:
                 print(f"Web search error for '{query[:30]}...': {e}")
                 r1 = []
@@ -1170,8 +1474,58 @@ def research_stream(req: ResearchRequest):
             if r1:
                 validation = validate_hypothesis(hyp, r1, provider=provider)
 
+            # If specific query failed or got no validation, try the broad query
             second_pass_used = False
             second_query = None
+            if query_broad and (not r1 or not validation.get("validated")):
+                second_pass_used = True
+                second_query = query_broad
+                _run_metric_incr("web_searches", 1)
+                try:
+                    r2 = openai_web_search(query_broad, model_override=req.model, trusted_sources=req.trusted_sources)
+                except Exception as e:
+                    print(f"Broad search error for '{query_broad[:30]}...': {e}")
+                    r2 = []
+                if r2:
+                    validation2 = validate_hypothesis(hyp, r2, provider=provider)
+                    if validation2.get("validated"):
+                        validation = validation2
+                        r1 = r2
+
+            # ── Pass 3: Targeted trusted-source search ──
+            # If we validated but the top source is NOT trusted, do one more
+            # search steered toward trusted domains via site: operators.
+            # This increases the verified-source ratio without replacing the
+            # evidence — we only swap in the trusted result if it also validates.
+            top_trusted = not r1 or not r1[0].get("is_trusted", False)
+            if validation.get("validated") and top_trusted:
+                sources_list = req.trusted_sources or _trusted_sources
+                # Pick top-5 trusted domains for the site: clause
+                top_domains = [s["domain"] for s in sources_list if s.get("tier") == "trusted"][:5]
+                if top_domains:
+                    site_clause = " OR ".join(f"site:{d}" for d in top_domains)
+                    targeted_query = f"{query} ({site_clause})"
+                    _run_metric_incr("web_searches", 1)
+                    try:
+                        r3 = openai_web_search(targeted_query, model_override=req.model, trusted_sources=req.trusted_sources)
+                    except Exception as e:
+                        print(f"Targeted search error: {e}")
+                        r3 = []
+                    if r3 and r3[0].get("is_trusted", False):
+                        validation3 = validate_hypothesis(hyp, r3, provider=provider)
+                        if validation3.get("validated"):
+                            validation = validation3
+                            r1 = r3
+
+            # Extract source trust metadata
+            source_trust = {}
+            if r1:
+                source_trust = {
+                    "trust_score": r1[0].get("trust_score", 3),
+                    "tier": r1[0].get("tier", "unverified"),
+                    "source_name": r1[0].get("source_name", ""),
+                    "is_trusted": r1[0].get("is_trusted", False),
+                }
 
             return {
                 "category": cat,
@@ -1185,6 +1539,7 @@ def research_stream(req: ResearchRequest):
                 "source": (r1[0].get("url") if r1 else None),
                 "source_title": (r1[0].get("title") if r1 else None),
                 "result_count": len(r1),
+                **source_trust,
             }
 
         step4_start = time.time()
@@ -1211,6 +1566,10 @@ def research_stream(req: ResearchRequest):
                         "evidence": item.get("evidence"),
                         "source": item.get("source"),
                         "source_title": item.get("source_title"),
+                        "trust_score": item.get("trust_score", 3),
+                        "tier": item.get("tier", "unverified"),
+                        "source_name": item.get("source_name", ""),
+                        "is_trusted": item.get("is_trusted", False),
                     }
                 )
 
@@ -1234,6 +1593,47 @@ def research_stream(req: ResearchRequest):
         })
         _end_span(span)
 
+        # ── Enforce minimum verified-source percentage ──
+        min_verified_pct = _app_config.get("minVerifiedSourcePct", 25)
+        if min_verified_pct and min_verified_pct > 0:
+            all_v = []
+            for cat in ["market", "brand", "competitive"]:
+                for v in validated.get(cat, []):
+                    all_v.append((cat, v))
+            total = len(all_v)
+            if total > 0:
+                trusted = sum(1 for _, v in all_v if v.get("is_trusted", False))
+                current_pct = trusted / total * 100
+                if current_pct < min_verified_pct:
+                    # Sort unverified items by trust_score ascending (drop worst first)
+                    unverified = [(cat, v) for cat, v in all_v if not v.get("is_trusted", False)]
+                    unverified.sort(key=lambda x: x[1].get("trust_score", 0))
+                    # Remove unverified items one at a time until threshold is met or
+                    # we'd drop everything unverified
+                    items_to_drop = set()
+                    remaining_total = total
+                    remaining_trusted = trusted
+                    for cat, v in unverified:
+                        if remaining_total <= 1 or remaining_trusted / remaining_total * 100 >= min_verified_pct:
+                            break
+                        items_to_drop.add(id(v))
+                        remaining_total -= 1
+                    if items_to_drop:
+                        pre_count = sum(len(vals) for vals in validated.values())
+                        for cat in ["market", "brand", "competitive"]:
+                            validated[cat] = [v for v in validated.get(cat, []) if id(v) not in items_to_drop]
+                        post_count = sum(len(vals) for vals in validated.values())
+                        new_trusted = sum(1 for cat in validated for v in validated[cat] if v.get("is_trusted"))
+                        new_pct = round(new_trusted / max(post_count, 1) * 100, 1)
+                        print(f"[MinVerified] Dropped {pre_count - post_count} unverified findings "
+                              f"({current_pct:.0f}% → {new_pct}%) to meet {min_verified_pct}% threshold")
+                        yield sse("quality_filter", {
+                            "dropped": pre_count - post_count,
+                            "before_pct": round(current_pct, 1),
+                            "after_pct": new_pct,
+                            "threshold": min_verified_pct,
+                        })
+
         # Step 5: Build summary + final response
         step5_start = time.time()
         summary = build_summary(validated)
@@ -1250,23 +1650,24 @@ def research_stream(req: ResearchRequest):
         else:
             metrics_arr = ["salient"]
 
-        ctx = _run_ctx.get() or {}
+        # Read from run_metrics directly (local closure variable) rather
+        # than the ContextVar, which may have lost propagation across yields.
         latency_ms = int((datetime.now() - started_at).total_seconds() * 1000)
 
-        tokens_in = int(ctx.get("tokens_in", 0) or 0)
-        tokens_out = int(ctx.get("tokens_out", 0) or 0)
+        tokens_in = int(run_metrics.get("tokens_in", 0) or 0)
+        tokens_out = int(run_metrics.get("tokens_out", 0) or 0)
 
         run_summary = {
-            "run_id": ctx.get("run_id"),
-            "started_at": ctx.get("started_at"),
+            "run_id": run_metrics.get("run_id"),
+            "started_at": run_metrics.get("started_at"),
             "latency_ms": latency_ms,
             "provider": provider,
             "question": req.question,
             "brand": parsed.get("brand"),
             "time_period": parsed.get("time_period"),
-            "web_searches": int(ctx.get("web_searches", 0) or 0),
-            "web_search_retries": int(ctx.get("web_search_retries", 0) or 0),
-            "llm_calls": int(ctx.get("llm_calls", 0) or 0),
+            "web_searches": int(run_metrics.get("web_searches", 0) or 0),
+            "web_search_retries": int(run_metrics.get("web_search_retries", 0) or 0),
+            "llm_calls": int(run_metrics.get("llm_calls", 0) or 0),
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "tokens_total": tokens_in + tokens_out,
@@ -1279,6 +1680,45 @@ def research_stream(req: ResearchRequest):
         RUN_LOG.append(run_summary)
         _emit_run_event(run_summary)
 
+        # Step 5b: Generate executive summary
+        exec_summary = ""
+        try:
+            all_evidence = []
+            for cat in ["market", "brand", "competitive"]:
+                for v in validated.get(cat, []):
+                    all_evidence.append(f"[{cat}] {v.get('evidence', '')} (Source: {v.get('source_name', 'unknown')})")
+            if all_evidence:
+                summary_prompt = f"""You are a research analyst. Based on the following validated findings about {parsed.get('brand', 'the brand')}, write a concise executive summary (3-5 sentences). Report ONLY the factual findings from the sources. DO NOT make inferences, draw conclusions about what the findings mean for the brand, or provide recommendations.
+
+Question: {req.question}
+
+Validated Findings:
+{chr(10).join(all_evidence)}
+
+Executive Summary:"""
+                exec_summary = llm_generate(summary_prompt, provider=provider, max_tokens=300)
+                # Strip the "Executive Summary:" prefix the LLM may echo back
+                exec_summary = re.sub(r'^\s*Executive\s+Summary\s*[:.]?\s*', '', exec_summary, flags=re.IGNORECASE).strip()
+        except Exception as e:
+            print(f"Executive summary error: {e}")
+            exec_summary = ""
+
+        yield sse("executive_summary", {"summary": exec_summary})
+
+        # Source policy stats
+        all_sources = []
+        for cat in ["market", "brand", "competitive"]:
+            for v in validated.get(cat, []):
+                all_sources.append(v)
+        trusted_count = sum(1 for s in all_sources if s.get("is_trusted"))
+        total_sources = len(all_sources)
+        source_policy = {
+            "trusted_source_count": trusted_count,
+            "total_source_count": total_sources,
+            "trusted_ratio": round(trusted_count / max(total_sources, 1) * 100, 1),
+            "social_media_filtered": True,
+        }
+
         resp = {
             "question": req.question,
             "brand": parsed.get("brand"),
@@ -1289,6 +1729,8 @@ def research_stream(req: ResearchRequest):
             "hypotheses": hypotheses,
             "validated_hypotheses": validated,
             "summary": summary,
+            "executive_summary": exec_summary,
+            "source_policy": source_policy,
             "run_id": run_id,
             "latency_ms": latency_ms,
             "web_searches": run_summary["web_searches"],
@@ -1302,6 +1744,7 @@ def research_stream(req: ResearchRequest):
 
         # best-effort clear run context
         _run_ctx.reset(token)
+        _fallback_metrics = None
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -1361,31 +1804,60 @@ def extract_json(text: str) -> Dict:
     return {}
 
 def generate_hypotheses(parsed: Dict, competitors: List[str], provider: Optional[str] = None, max_per_category: int = 4, system_prompt: Optional[str] = None) -> Dict[str, List[Dict]]:
-    """Generate hypotheses for market, brand, and competitive factors"""
+    """Generate hypotheses for market, brand, and competitive factors.
+    
+    Industry-agnostic: prompts adapt to the brand rather than
+    assuming fashion/retail.
+    """
     
     brand = parsed["brand"]
     direction = parsed["direction"]
     time_period = parsed.get("time_period", "2025")
+    metric = parsed.get("metric", "salience")
+    region = parsed.get("region", "")
     n = max_per_category
+    
+    # Build a region clause for prompts
+    region_clause = f" in {region}" if region else ""
     
     hypotheses = {"market": [], "brand": [], "competitive": []}
     
-    # Market hypotheses
+    # ── Step 0: Determine industry context ──────────────────────────
+    # Let the LLM figure out the industry so all subsequent prompts
+    # are contextually appropriate.
+    industry = ""
+    try:
+        industry_prompt = f"""What industry does the brand "{brand}" operate in?
+Return ONLY a JSON object: {{"industry": "automotive"}}, {{"industry": "fashion retail"}}, etc.
+One or two words maximum for the industry value."""
+        ind_content = llm_generate(industry_prompt, provider=provider, max_tokens=50)
+        ind_data = extract_json(ind_content)
+        industry = ind_data.get("industry", "")
+    except Exception:
+        pass
+    
+    industry_clause = f" ({industry})" if industry else ""
+    
+    # ── Market hypotheses ───────────────────────────────────────────
     market_prompt = f"""You are a brand research analyst. Generate exactly {n} specific hypotheses about macro market trends
-that could explain why {brand}'s brand salience {direction}d during {time_period}.
+that could explain why {brand}{industry_clause}'s brand {metric} {direction}d during {time_period}{region_clause}.
 
-Focus on CONCRETE, SEARCHABLE trends like:
-- Economic conditions (consumer spending, inflation, currency)
-- Industry shifts (athleisure growth, sustainability trends, digital fashion)
-- Consumer behavior changes (social media trends, shopping habits)
-- Regulatory or trade changes (tariffs, supply chain)
+Focus on CONCRETE, SEARCHABLE trends relevant to {brand}'s industry:
+- Economic conditions (consumer spending, inflation, currency, interest rates)
+- Industry-specific shifts (regulatory changes, technology disruption, supply chain)
+- Consumer behavior changes (purchasing patterns, preferences, demographics)
+- Political, trade, or environmental factors
 
-IMPORTANT: Each search_query MUST include "{brand}" and "{time_period}" and be specific enough to find real news articles.
+CRITICAL RULES:
+- Every hypothesis MUST be directly relevant to {brand} and its industry{industry_clause}
+- Do NOT include hypotheses about unrelated industries or brands
+- search_query: specific, targeted query (MUST include "{brand}" and "{time_period}")
+- search_query_broad: broader fallback query (MUST include "{brand}" and "{time_period}")
 
 Return ONLY a JSON object:
 {{"hypotheses": [
-  {{"id": "M1", "hypothesis": "specific trend description", "search_query": "{brand} specific trend {time_period}"}},
-  {{"id": "M2", "hypothesis": "another trend", "search_query": "{brand} another specific term {time_period}"}}
+  {{"id": "M1", "hypothesis": "specific trend affecting {brand}", "search_query": "{brand} specific trend {time_period}", "search_query_broad": "{brand} market trends {time_period}"}},
+  {{"id": "M2", "hypothesis": "another trend", "search_query": "{brand} specific term {time_period}", "search_query_broad": "{brand} industry trend {time_period}"}}
 ]}}"""
     
     try:
@@ -1398,29 +1870,32 @@ Return ONLY a JSON object:
     # Fallback market hypotheses
     if not hypotheses["market"]:
         hypotheses["market"] = [
-            {"id": "M1", "hypothesis": f"Economic downturn affecting fashion spending in {time_period}", "search_query": f"{brand} fashion spending economy {time_period}"},
-            {"id": "M2", "hypothesis": "Online shopping shift away from physical retail", "search_query": f"{brand} online fashion shopping growth {time_period}"},
-            {"id": "M3", "hypothesis": "Seasonal trends or weather impacting fashion sales", "search_query": f"{brand} fashion sales seasonal {time_period}"}
+            {"id": "M1", "hypothesis": f"Economic downturn affecting {brand}'s sector in {time_period}", "search_query": f"{brand} economic impact {time_period}", "search_query_broad": f"{brand} market conditions {time_period}"},
+            {"id": "M2", "hypothesis": f"Consumer sentiment shift in {brand}'s market", "search_query": f"{brand} consumer sentiment {time_period}", "search_query_broad": f"{brand} market changes {time_period}"},
+            {"id": "M3", "hypothesis": f"Regulatory or policy changes affecting {brand}", "search_query": f"{brand} regulations policy {time_period}", "search_query_broad": f"{brand} industry news {time_period}"}
         ][:n]
     
-    # Brand hypotheses
+    # ── Brand hypotheses ────────────────────────────────────────────
     brand_prompt = f"""You are a brand research analyst. Generate exactly {n} specific hypotheses about {brand}'s own actions
-that could explain why its brand salience {direction}d during {time_period}.
+that could explain why its brand {metric} {direction}d during {time_period}{region_clause}.
 
-Focus on CONCRETE actions like:
-- Specific advertising campaigns or celebrity endorsements (name the celebrity/campaign)
-- Store openings, closures, or flagship launches (name the city/location)
-- Product launches or collections (name the product line)
-- PR events, controversies, or media coverage (name the event)
-- Sponsorship deals or partnerships (name the partner)
+Focus on CONCRETE actions by {brand}{industry_clause}:
+- Specific advertising campaigns, endorsements, or sponsorships (name them)
+- Product launches, recalls, or discontinuations (name specific products)
+- Store/facility openings, closures, or expansions (name locations)
+- Leadership changes, controversies, PR events (name specifics)
+- Pricing, strategy, or business model changes
 
-IMPORTANT: Each hypothesis MUST mention a specific action, person, or event — not generic descriptions.
-Each search_query MUST include "{brand}" and "{time_period}".
+CRITICAL RULES:
+- Each hypothesis MUST be about {brand} specifically, not generic industry trends
+- Each hypothesis MUST mention a specific action, person, product, or event
+- search_query: specific, targeted (MUST include "{brand}" and "{time_period}")
+- search_query_broad: broader fallback (MUST include "{brand}" and "{time_period}")
 
 Return ONLY a JSON object:
 {{"hypotheses": [
-  {{"id": "B1", "hypothesis": "{brand} did X specific thing", "search_query": "{brand} specific action {time_period}"}},
-  {{"id": "B2", "hypothesis": "{brand} launched Y", "search_query": "{brand} Y launch {time_period}"}}
+  {{"id": "B1", "hypothesis": "{brand} did X", "search_query": "{brand} specific action {time_period}", "search_query_broad": "{brand} news {time_period}"}},
+  {{"id": "B2", "hypothesis": "{brand} launched Y", "search_query": "{brand} Y launch {time_period}", "search_query_broad": "{brand} product launch {time_period}"}}
 ]}}"""
     
     try:
@@ -1433,29 +1908,42 @@ Return ONLY a JSON object:
     # Fallback brand hypotheses
     if not hypotheses["brand"]:
         hypotheses["brand"] = [
-            {"id": "B1", "hypothesis": f"{brand} store closures or reduced presence", "search_query": f"{brand} store closures {time_period}"},
-            {"id": "B2", "hypothesis": f"{brand} marketing or advertising spend changes", "search_query": f"{brand} advertising marketing {time_period}"},
-            {"id": "B3", "hypothesis": f"News or media coverage about {brand}", "search_query": f"{brand} news media {time_period}"}
+            {"id": "B1", "hypothesis": f"{brand} had significant business changes", "search_query": f"{brand} business changes {time_period}", "search_query_broad": f"{brand} news {time_period}"},
+            {"id": "B2", "hypothesis": f"{brand} launched major campaign or product", "search_query": f"{brand} campaign launch {time_period}", "search_query_broad": f"{brand} marketing {time_period}"},
+            {"id": "B3", "hypothesis": f"{brand} faced controversy or PR issues", "search_query": f"{brand} controversy news {time_period}", "search_query_broad": f"{brand} media coverage {time_period}"}
         ][:n]
     
-    # Competitive hypotheses
-    comp_list = ', '.join(competitors[:6]) if competitors else "Adidas, Puma, Under Armour, New Balance, Reebok"
+    # ── Competitive hypotheses ──────────────────────────────────────
+    # Auto-detect competitors if none provided
+    if not competitors:
+        try:
+            comp_detect_prompt = f"""Name the top 5 direct competitors of {brand}{industry_clause}.
+Return ONLY a JSON object: {{"competitors": ["Competitor1", "Competitor2", ...]}}"""
+            comp_content = llm_generate(comp_detect_prompt, provider=provider, max_tokens=100)
+            comp_data = extract_json(comp_content)
+            competitors = comp_data.get("competitors", [])[:6]
+        except Exception:
+            pass
+    
+    comp_list = ', '.join(competitors[:6]) if competitors else f"major competitors in {brand}'s industry"
     comp_prompt = f"""You are a brand research analyst. Generate exactly {n} specific hypotheses about how NAMED competitors
-affected {brand}'s brand salience during {time_period}.
+affected {brand}'s brand {metric} during {time_period}{region_clause}.
 
 Available competitors: {comp_list}
 
 CRITICAL RULES:
-1. Each hypothesis MUST name a SPECIFIC competitor brand (e.g., "Adidas", "Puma", not "a competitor")
+1. Each hypothesis MUST name a SPECIFIC competitor brand from the list above
 2. Each hypothesis should focus on a DIFFERENT competitor
-3. Include specific actions: campaigns, product launches, celebrity endorsements, store openings, viral moments
-4. Each search_query MUST include the competitor's name and "{time_period}"
+3. Competitors MUST be in the SAME industry as {brand}{industry_clause}
+4. Include specific actions: campaigns, product launches, pricing moves, expansions, viral moments
+5. search_query: specific, targeted (MUST include the competitor name and "{time_period}")
+6. search_query_broad: broader fallback (MUST include the competitor name and "{time_period}")
+7. Do NOT include competitors from unrelated industries
 
 Return ONLY a JSON object:
 {{"hypotheses": [
-  {{"id": "C1", "hypothesis": "Adidas launched [specific campaign/product] that drew attention from {brand}", "search_query": "Adidas campaign launch {time_period}"}},
-  {{"id": "C2", "hypothesis": "Puma's [specific action] increased their visibility vs {brand}", "search_query": "Puma marketing news {time_period}"}},
-  {{"id": "C3", "hypothesis": "Under Armour [specific action] impacted {brand}'s market position", "search_query": "Under Armour news {time_period}"}}
+  {{"id": "C1", "hypothesis": "[Competitor] launched [specific campaign] that drew attention from {brand}", "search_query": "[Competitor] specific campaign {time_period}", "search_query_broad": "[Competitor] marketing news {time_period}"}},
+  {{"id": "C2", "hypothesis": "[Competitor] [specific action] increased visibility vs {brand}", "search_query": "[Competitor] specific action {time_period}", "search_query_broad": "[Competitor] brand news {time_period}"}}
 ]}}"""
     
     try:
@@ -1467,19 +1955,70 @@ Return ONLY a JSON object:
     
     # Fallback competitive hypotheses  
     if not hypotheses["competitive"]:
-        comp_fallback = competitors[:4] if competitors else ["Zara", "H&M", "Primark"]
-        hypotheses["competitive"] = [
-            {"id": "C1", "hypothesis": f"{comp_fallback[0]} launched major marketing campaign", "search_query": f"{comp_fallback[0]} marketing campaign UK {time_period}"},
-            {"id": "C2", "hypothesis": f"{comp_fallback[1] if len(comp_fallback) > 1 else comp_fallback[0]} store expansion or new initiatives", "search_query": f"{comp_fallback[1] if len(comp_fallback) > 1 else comp_fallback[0]} stores UK {time_period}"},
-            {"id": "C3", "hypothesis": "Competitor news or media dominance", "search_query": f"UK fashion retailers competition {time_period}"}
-        ][:n]
+        if competitors:
+            hypotheses["competitive"] = [
+                {"id": f"C{i+1}", "hypothesis": f"{comp} gained market share or brand visibility vs {brand}", "search_query": f"{comp} brand marketing {time_period}", "search_query_broad": f"{comp} news {time_period}"}
+                for i, comp in enumerate(competitors[:n])
+            ]
+        else:
+            hypotheses["competitive"] = [
+                {"id": "C1", "hypothesis": f"A competitor gained visibility over {brand}", "search_query": f"{brand} competitors market share {time_period}", "search_query_broad": f"{brand} competition {time_period}"}
+            ]
+    
+    # ── Relevance filter ────────────────────────────────────────────
+    # Final check: remove any hypotheses that are obviously irrelevant
+    # to the brand or its industry.
+    # SAFEGUARD: never remove ALL hypotheses from any category.
+    try:
+        all_hyps = []
+        for cat in ["market", "brand", "competitive"]:
+            for h in hypotheses.get(cat, []):
+                all_hyps.append({"category": cat, "id": h.get("id"), "hypothesis": h.get("hypothesis", "")})
+        
+        if all_hyps:
+            filter_prompt = f"""You are a quality-control analyst. Review these hypotheses generated for the brand "{brand}"{industry_clause}.
+The research question is: "{parsed.get('question', f'{brand} {metric} {direction} {time_period}')}"
+
+Hypotheses:
+{json.dumps(all_hyps, indent=2)}
+
+Identify any hypotheses that are NOT genuinely relevant to {brand} or its industry{industry_clause}.
+A hypothesis is IRRELEVANT ONLY if:
+- It mentions brands, products, or trends from a COMPLETELY DIFFERENT industry
+- It has absolutely no logical connection to {brand}
+
+IMPORTANT: Be conservative. When in doubt, keep the hypothesis.
+- Competitor actions from the SAME industry are ALWAYS relevant — do NOT remove them.
+- General market/economic trends are usually relevant — do NOT remove them.
+- Only remove things that are clearly from a wrong industry (e.g. sneaker news for an auto brand).
+
+Return ONLY a JSON object with the IDs to REMOVE:
+{{"remove_ids": ["M3", "C2"]}}
+If ALL hypotheses are relevant, return: {{"remove_ids": []}}"""
+            
+            filter_content = llm_generate(filter_prompt, provider=provider, max_tokens=200)
+            filter_data = extract_json(filter_content)
+            remove_ids = set(filter_data.get("remove_ids", []))
+            
+            if remove_ids:
+                print(f"Relevance filter removing: {remove_ids}")
+                for cat in ["market", "brand", "competitive"]:
+                    original = hypotheses[cat]
+                    filtered = [h for h in original if h.get("id") not in remove_ids]
+                    # SAFEGUARD: never empty a category entirely
+                    if not filtered and original:
+                        print(f"  ⚠ Relevance filter would empty '{cat}' — keeping first hypothesis")
+                        filtered = [original[0]]
+                    hypotheses[cat] = filtered
+    except Exception as e:
+        print(f"Relevance filter error (non-fatal): {e}")
     
     return hypotheses
 
-def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None) -> tuple[Dict[str, List[Dict]], Dict[str, int]]:
-    """Process each hypothesis: search + validate in parallel.
+def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Optional[str] = None, model_override: Optional[str] = None) -> tuple[Dict[str, List[Dict]], Dict[str, int]]:
+    """Process each hypothesis: search + validate sequentially.
 
-    Implements a targeted second-pass search when the first pass is weak.
+    Uses dual-query strategy: specific first, broad fallback.
     """
 
     eval_mode = bool(_eval_mode.get() or False)
@@ -1513,17 +2052,18 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
 
     def process_one(hyp, cat):
         query = hyp.get("search_query", hyp.get("hypothesis", ""))
+        query_broad = hyp.get("search_query_broad", "")
         if not query:
             return {"category": cat, "_web_searches": 0, "_web_search_retries": 0}
 
         local_searches = 0
 
         try:
-            # Web search (single pass, no retry)
+            # Web search — try specific query first
             print(f"Searching: {query[:50]}...")
             local_searches += 1
             try:
-                r1 = openai_web_search(query)
+                r1 = openai_web_search(query, model_override=model_override)
             except Exception as e:
                 print(f"Web search error for '{query[:30]}...': {e}")
                 r1 = []
@@ -1533,6 +2073,22 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
             if r1:
                 validation = validate_hypothesis(hyp, r1, provider=provider)
                 print(f"Validation: {validation.get('validated')} - {validation.get('evidence', '')[:50]}...")
+
+            # If specific query failed or got no validation, try the broad query
+            if query_broad and (not r1 or not validation.get("validated")):
+                print(f"Trying broad query: {query_broad[:50]}...")
+                local_searches += 1
+                try:
+                    r2 = openai_web_search(query_broad, model_override=model_override)
+                except Exception as e:
+                    print(f"Broad search error for '{query_broad[:30]}...': {e}")
+                    r2 = []
+                if r2:
+                    validation2 = validate_hypothesis(hyp, r2, provider=provider)
+                    if validation2.get("validated"):
+                        validation = validation2
+                        r1 = r2
+                        print(f"Broad validated: {validation2.get('evidence', '')[:50]}...")
 
             if r1 and validation.get("validated"):
                 return {
@@ -1545,7 +2101,7 @@ def process_hypotheses_parallel(hypotheses: Dict, parsed: Dict, provider: Option
                         "evidence": validation.get("evidence"),
                         "source": r1[0].get("url"),
                         "source_title": r1[0].get("title"),
-                        "second_pass_used": False,
+                        "second_pass_used": bool(query_broad and local_searches > 1),
                     },
                 }
 
@@ -1595,9 +2151,16 @@ def validate_hypothesis(hypothesis: Dict, search_results: List[Dict], provider: 
 Search Results:
 {search_text}
 
-Does this search result contain relevant information that supports or relates to the hypothesis?
+Does this search result contain relevant factual information that supports or relates to the hypothesis?
 Be generous — if the evidence is even partially relevant, validate it.
-Return JSON: {{"validated": true/false, "evidence": "SHORT factual summary (20 words max) with key numbers/dates"}}"""
+
+IMPORTANT RULES:
+- DO NOT make inferences or draw conclusions about what the evidence means for the brand or client.
+- DO NOT interpret or speculate beyond what the sources explicitly state.
+- Only report the factual findings from the search results.
+- Your evidence should be a direct summary of what the source says, not an interpretation.
+
+Return JSON: {{"validated": true/false, "evidence": "SHORT factual summary (20 words max) with key numbers/dates from the source"}}"""
     
     try:
         content = llm_generate(prompt, provider=provider, max_tokens=500)

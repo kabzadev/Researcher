@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Diagnostic test for Azure OpenAI web_search_preview.
+"""Model comparison test for KAIA Researcher.
 
-Runs a single research question end-to-end and prints detailed output
-at every step so we can see exactly what's happening.
+Runs the same research question against multiple Azure OpenAI models
+and generates a comparison report.
 
 Usage:
-  python test_search.py                     # test against deployed Azure API
+  python test_search.py                     # test default model
+  python test_search.py --model gpt-4o      # test specific model
+  python test_search.py --compare           # compare ALL deployed models
   python test_search.py --local             # test against localhost:8000
-  python test_search.py --direct            # test openai_web_search directly (requires env vars)
 """
 
 import argparse
@@ -25,220 +26,316 @@ APP_PASSWORD = "KantarResearch"
 
 QUESTION = "Salience increased in Q4 2025 for Nike in China — what external events could explain it?"
 
-
-def test_direct_search():
-    """Test openai_web_search directly against Azure OpenAI."""
-    # Import from main.py
-    sys.path.insert(0, os.path.dirname(__file__))
-    from main import openai_web_search, _is_azure, OPENAI_MODEL
-
-    print(f"\n{'='*70}")
-    print(f"DIRECT SEARCH TEST")
-    print(f"  Azure mode: {_is_azure}")
-    print(f"  Model: {OPENAI_MODEL}")
-    print(f"  Search model: {os.getenv('OPENAI_SEARCH_MODEL', OPENAI_MODEL)}")
-    print(f"{'='*70}\n")
-
-    test_queries = [
-        "Nike Q4 2025 social media marketing campaign China",
-        "Adidas Q4 2025 marketing campaign launch",
-        "Nike sales revenue Q4 2025",
-    ]
-
-    for i, query in enumerate(test_queries, 1):
-        print(f"\n--- Query {i}/{len(test_queries)}: {query} ---")
-        start = time.time()
-        try:
-            results = openai_web_search(query)
-            elapsed = time.time() - start
-            print(f"  Duration: {elapsed:.1f}s")
-            print(f"  Results: {len(results)}")
-            for j, r in enumerate(results[:3]):
-                print(f"    [{j}] title: {r.get('title', '')[:60]}")
-                print(f"        url: {r.get('url', '')[:80]}")
-                content = r.get('raw_content', r.get('content', ''))
-                print(f"        content: {content[:200]}...")
-        except Exception as e:
-            elapsed = time.time() - start
-            print(f"  ERROR after {elapsed:.1f}s: {e}")
-
-        # Rate limit protection
-        if i < len(test_queries):
-            print(f"  (waiting 3s before next query...)")
-            time.sleep(3)
+MODELS = [
+    "gpt-4o",         # 2024-08-06 original
+    "gpt-4o-latest",  # 2024-11-20 improved
+    "gpt-4-1",        # 2025-04-14 GPT-4.1
+    "gpt-5-mini",     # 2025-08-07 GPT-5 mini
+]
 
 
-def test_api(base_url: str):
-    """Test the full research API endpoint."""
-    print(f"\n{'='*70}")
-    print(f"API TEST: {base_url}")
-    print(f"{'='*70}\n")
-
-    # Step 1: Health check
-    print("1. Health check...")
-    try:
-        r = httpx.get(f"{base_url}/", headers={"Authorization": f"Bearer {APP_PASSWORD}"}, timeout=10)
-        print(f"   Status: {r.status_code}")
-    except Exception as e:
-        print(f"   ERROR: {e}")
-        return
-
-    # Step 2: Send research request (streaming)
-    print(f"\n2. Research question: {QUESTION[:60]}...")
-    print(f"   Streaming response...\n")
+def test_model(base_url: str, model: str = None, verbose: bool = True, max_per_category: int = None) -> dict:
+    """Test a single model and return structured results."""
+    label = model or "default"
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"TESTING MODEL: {label}" + (f" (max_per_category={max_per_category})" if max_per_category else ""))
+        print(f"{'='*70}\n")
 
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {APP_PASSWORD}"}
     payload = {
         "question": QUESTION,
         "provider": "openai",
-        "password": APP_PASSWORD,
     }
+    if model:
+        payload["model"] = model
+    if max_per_category:
+        payload["max_hypotheses_per_category"] = max_per_category
 
     start = time.time()
-    hypotheses_seen = {"market": 0, "brand": 0, "competitive": 0}
-    validated_count = {"market": 0, "brand": 0, "competitive": 0}
-    errors = []
 
     try:
-        with httpx.stream(
-            "POST",
+        # Use the non-streaming /research endpoint which returns JSON
+        response = httpx.post(
             f"{base_url}/research",
             json=payload,
             headers=headers,
-            timeout=httpx.Timeout(300.0, connect=30.0),
-        ) as response:
-            print(f"   HTTP Status: {response.status_code}")
-            if response.status_code != 200:
-                print(f"   Body: {response.read().decode()[:500]}")
-                return
+            timeout=httpx.Timeout(600.0, connect=30.0),
+        )
 
-            buffer = ""
-            for chunk in response.iter_text():
-                buffer += chunk
-                while "\n\n" in buffer:
-                    event_raw, buffer = buffer.split("\n\n", 1)
-                    lines = event_raw.strip().split("\n")
-                    event_type = None
-                    data_str = None
-                    for line in lines:
-                        if line.startswith("event: "):
-                            event_type = line[7:]
-                        elif line.startswith("data: "):
-                            data_str = line[6:]
+        total = time.time() - start
 
-                    if not event_type or not data_str:
-                        continue
+        if response.status_code != 200:
+            body = response.text[:500]
+            if verbose:
+                print(f"   HTTP {response.status_code}: {body}")
+            return {"model": label, "error": f"HTTP {response.status_code}: {body[:100]}", "total_time": round(total, 1),
+                    "hypotheses_total": 0, "validated_total": 0, "validation_rate": 0,
+                    "market_hyps": 0, "brand_hyps": 0, "competitive_hyps": 0,
+                    "market_validated": 0, "brand_validated": 0, "competitive_validated": 0,
+                    "broad_queries_used": 0, "errors": 1, "validated_items": {}, "details": []}
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+        data = response.json()
 
-                    elapsed = time.time() - start
+        # Extract hypotheses counts
+        hypotheses = data.get("hypotheses", {})
+        hypotheses_seen = {
+            "market": len(hypotheses.get("market", [])),
+            "brand": len(hypotheses.get("brand", [])),
+            "competitive": len(hypotheses.get("competitive", [])),
+        }
 
-                    if event_type == "status":
-                        stage = data.get("stage", "")
-                        print(f"   [{elapsed:5.1f}s] STATUS: {stage}")
-                        if "total_hypotheses" in data:
-                            print(f"           Total hypotheses: {data['total_hypotheses']}")
+        # Extract validated hypotheses
+        validated = data.get("validated_hypotheses", {})
+        validated_count = {
+            "market": len(validated.get("market", [])),
+            "brand": len(validated.get("brand", [])),
+            "competitive": len(validated.get("competitive", [])),
+        }
 
-                    elif event_type == "hypotheses":
-                        for cat in ["market", "brand", "competitive"]:
-                            hyps = data.get(cat, [])
-                            hypotheses_seen[cat] = len(hyps)
-                            if hyps:
-                                print(f"   [{elapsed:5.1f}s] HYPOTHESES ({cat}): {len(hyps)} generated")
-                                for h in hyps:
-                                    print(f"           - {h.get('hypothesis', '')[:80]}")
-                                    print(f"             search_query: {h.get('search_query', '')[:60]}")
+        validated_items = {"market": [], "brand": [], "competitive": []}
+        for cat in ["market", "brand", "competitive"]:
+            for item in validated.get(cat, []):
+                validated_items[cat].append({
+                    "hypothesis": (item.get("hypothesis") or "")[:100],
+                    "evidence": (item.get("evidence") or "")[:100],
+                    "source": (item.get("source_title") or item.get("source") or "")[:80],
+                    "second_pass": item.get("second_pass_used", False),
+                })
 
-                    elif event_type == "hypothesis_result":
-                        cat = data.get("category", "?")
-                        validated = data.get("validated", False)
-                        query = data.get("search_query", "")[:50]
-                        evidence = data.get("evidence", "")[:60]
-                        error = data.get("error", "")
-                        completed = data.get("completed", "?")
-                        total = data.get("total", "?")
-                        result_count = data.get("result_count", 0)
+        # Count broad queries
+        broad_used = sum(1 for cat in validated_items.values() for item in cat if item.get("second_pass"))
 
-                        status = "✅ VALIDATED" if validated else "❌ FAILED"
-                        print(f"   [{elapsed:5.1f}s] {status} ({cat}) [{completed}/{total}]")
-                        print(f"           query: {query}")
-                        print(f"           results: {result_count}, evidence: {evidence}")
-                        if error:
-                            print(f"           ERROR: {error}")
-                            errors.append(error)
+        total_hyps = sum(hypotheses_seen.values())
+        total_validated = sum(validated_count.values())
 
-                        if validated:
-                            validated_count[cat] += 1
+        if verbose:
+            print(f"   Time: {total:.1f}s")
+            print(f"   Hypotheses: market={hypotheses_seen['market']}, brand={hypotheses_seen['brand']}, competitive={hypotheses_seen['competitive']}")
+            print(f"   Validated: market={validated_count['market']}, brand={validated_count['brand']}, competitive={validated_count['competitive']}")
+            print(f"   Total: {total_validated}/{total_hyps} ({round(total_validated/max(total_hyps,1)*100,1)}%)")
+            print(f"   Broad queries rescued: {broad_used}")
+            print()
+            for cat in ["market", "brand", "competitive"]:
+                items = validated_items[cat]
+                if items:
+                    print(f"   {cat.upper()} ({len(items)} validated):")
+                    for item in items:
+                        bp = " [broad]" if item.get("second_pass") else ""
+                        print(f"     ✅ {item['hypothesis'][:70]}")
+                        print(f"        Evidence: {item['evidence'][:70]}{bp}")
+                else:
+                    print(f"   {cat.upper()}: ❌ no validated results")
 
-                    elif event_type == "summary":
-                        print(f"\n   [{elapsed:5.1f}s] SUMMARY received")
-                        for key in ["macro_drivers", "brand_drivers", "competitive_drivers"]:
-                            drivers = data.get(key, [])
-                            print(f"           {key}: {len(drivers)} items")
-                            for d_item in drivers:
-                                print(f"             - {d_item.get('hypothesis', '')[:70]}")
+        # Also extract the summary
+        summary = data.get("summary", {})
 
-                    elif event_type == "complete":
-                        total_time = data.get("total_time_seconds", elapsed)
-                        print(f"\n   [{elapsed:5.1f}s] COMPLETE (server: {total_time:.1f}s)")
+        result = {
+            "model": label,
+            "max_per_cat": max_per_category or 4,
+            "total_time": round(total, 1),
+            "hypotheses_total": total_hyps,
+            "market_hyps": hypotheses_seen["market"],
+            "brand_hyps": hypotheses_seen["brand"],
+            "competitive_hyps": hypotheses_seen["competitive"],
+            "validated_total": total_validated,
+            "market_validated": validated_count["market"],
+            "brand_validated": validated_count["brand"],
+            "competitive_validated": validated_count["competitive"],
+            "validation_rate": round(total_validated / max(total_hyps, 1) * 100, 1),
+            "broad_queries_used": broad_used,
+            "errors": 0,
+            "validated_items": validated_items,
+            "summary": summary,
+            "details": [],
+        }
 
-                    elif event_type == "error":
-                        print(f"   [{elapsed:5.1f}s] ERROR: {data}")
+        if verbose:
+            print(f"\n   RESULT: {total_validated}/{total_hyps} validated ({result['validation_rate']}%) in {total:.1f}s")
+
+        return result
 
     except Exception as e:
         elapsed = time.time() - start
-        print(f"\n   EXCEPTION after {elapsed:.1f}s: {e}")
+        if verbose:
+            print(f"   EXCEPTION after {elapsed:.1f}s: {e}")
+        return {"model": label, "error": str(e), "total_time": round(elapsed, 1),
+                "hypotheses_total": 0, "validated_total": 0, "validation_rate": 0,
+                "market_hyps": 0, "brand_hyps": 0, "competitive_hyps": 0,
+                "market_validated": 0, "brand_validated": 0, "competitive_validated": 0,
+                "broad_queries_used": 0, "errors": 1, "validated_items": {}, "details": []}
 
-    # Summary
-    total = time.time() - start
-    print(f"\n{'='*70}")
-    print(f"RESULTS SUMMARY")
-    print(f"{'='*70}")
-    print(f"  Total time: {total:.1f}s")
-    print(f"  Hypotheses generated: market={hypotheses_seen['market']}, brand={hypotheses_seen['brand']}, competitive={hypotheses_seen['competitive']}")
-    print(f"  Validated:            market={validated_count['market']}, brand={validated_count['brand']}, competitive={validated_count['competitive']}")
-    print(f"  Total validated: {sum(validated_count.values())} / {sum(hypotheses_seen.values())}")
-    if errors:
-        print(f"  Errors: {len(errors)}")
-        for e in errors[:5]:
-            print(f"    - {e[:80]}")
 
-    # Quality assessment
-    total_validated = sum(validated_count.values())
-    if total_validated >= 8:
-        print(f"\n  ✅ QUALITY: GOOD ({total_validated} validated)")
-    elif total_validated >= 5:
-        print(f"\n  ⚠️  QUALITY: ACCEPTABLE ({total_validated} validated)")
-    elif total_validated >= 2:
-        print(f"\n  ❌ QUALITY: POOR ({total_validated} validated)")
+def compare_models(base_url: str, models: list, wait_between: int = 90, max_per_category: int = None):
+    """Run tests for multiple models and generate comparison."""
+    results = []
+
+    for i, model in enumerate(models):
+        print(f"\n{'#'*70}")
+        print(f"# MODEL {i+1}/{len(models)}: {model}")
+        print(f"{'#'*70}")
+
+        result = test_model(base_url, model=model, verbose=True, max_per_category=max_per_category)
+        results.append(result)
+
+        # Wait between models to let rate limits reset
+        if i < len(models) - 1:
+            print(f"\n   ⏳ Waiting {wait_between}s for rate limit reset...")
+            time.sleep(wait_between)
+
+    return results
+
+
+def generate_report(results: list, output_path: str):
+    """Generate a markdown comparison report."""
+    # Sort by validation rate (desc), then by time (asc)
+    ranked = sorted(results, key=lambda r: (-r["validated_total"], -r["validation_rate"], r["total_time"]))
+
+    report = []
+    report.append("# KAIA Researcher — Model Comparison Report")
+    report.append(f"\n**Generated:** {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append(f"\n**Test Question:** {QUESTION}")
+    report.append("")
+
+    # Summary table
+    report.append("## Results Summary")
+    report.append("")
+    report.append("| Rank | Model | Hypotheses | Validated | Rate | Market | Brand | Competitive | Broad Rescued | Time |")
+    report.append("|------|-------|------------|-----------|------|--------|-------|-------------|---------------|------|")
+
+    for i, r in enumerate(ranked, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+        error = " ⚠️" if r.get("error") else ""
+        mpc = f" ({r.get('max_per_cat', 4)}/cat)" if r.get("max_per_cat") else ""
+        report.append(
+            f"| {medal} {i} | **{r['model']}**{mpc} | "
+            f"{r['hypotheses_total']} | "
+            f"{r['validated_total']} | "
+            f"{r['validation_rate']}% | "
+            f"{r['market_validated']}/{r['market_hyps']} | "
+            f"{r['brand_validated']}/{r['brand_hyps']} | "
+            f"{r['competitive_validated']}/{r['competitive_hyps']} | "
+            f"{r['broad_queries_used']} | "
+            f"{r['total_time']:.0f}s{error} |"
+        )
+
+    report.append("")
+
+    # Winner
+    winner = ranked[0]
+    report.append("## 🏆 Recommendation")
+    report.append("")
+    if winner.get("error"):
+        report.append(f"⚠️ **{winner['model']}** had errors: {winner['error']}")
     else:
-        print(f"\n  🚫 QUALITY: FAILING ({total_validated} validated)")
+        report.append(f"**Best Model: `{winner['model']}`**")
+        report.append(f"- Validated **{winner['validated_total']}/{winner['hypotheses_total']}** hypotheses ({winner['validation_rate']}%)")
+        report.append(f"- Completed in **{winner['total_time']:.0f}s**")
+        report.append(f"- Coverage: Market={winner['market_validated']}, Brand={winner['brand_validated']}, Competitive={winner['competitive_validated']}")
+        if winner['broad_queries_used'] > 0:
+            report.append(f"- Used {winner['broad_queries_used']} broad fallback queries to recover results")
+    report.append("")
 
-    if total > 120:
-        print(f"  🐢 SPEED: TOO SLOW ({total:.0f}s)")
-    elif total > 60:
-        print(f"  ⚠️  SPEED: SLOW ({total:.0f}s)")
-    else:
-        print(f"  ✅ SPEED: OK ({total:.0f}s)")
+    # Detailed results per model
+    report.append("## Detailed Results")
+    report.append("")
 
-    # Check all categories
-    for cat, count in validated_count.items():
-        if count == 0:
-            print(f"  🚫 MISSING CATEGORY: {cat} has 0 validated hypotheses!")
-    print()
+    for r in ranked:
+        mpc = f" ({r.get('max_per_cat', 4)} per category)" if r.get("max_per_cat") else ""
+        report.append(f"### {r['model']}{mpc}")
+        report.append("")
+        if r.get("error"):
+            report.append(f"**Error:** {r['error']}")
+            report.append("")
+            continue
+
+        report.append(f"- **Time:** {r['total_time']:.0f}s")
+        report.append(f"- **Hypotheses:** {r['hypotheses_total']}")
+        report.append(f"- **Validation Rate:** {r['validation_rate']}% ({r['validated_total']}/{r['hypotheses_total']})")
+        report.append(f"- **Broad Queries Used:** {r['broad_queries_used']}")
+        report.append("")
+
+        for cat in ["market", "brand", "competitive"]:
+            items = r.get("validated_items", {}).get(cat, [])
+            hyps = r.get(f"{cat}_hyps", 0)
+            report.append(f"**{cat.title()} ({len(items)}/{hyps} validated):**")
+            if items:
+                for item in items:
+                    bp = " *(broad query)*" if item.get("second_pass") else ""
+                    report.append(f"- {item['hypothesis']}")
+                    report.append(f"  - Evidence: {item['evidence']}{bp}")
+                    if item.get("source"):
+                        report.append(f"  - Source: {item['source']}")
+            else:
+                report.append("- *(no validated results)*")
+            report.append("")
+
+    # Analysis
+    report.append("## Analysis")
+    report.append("")
+
+    # Speed comparison
+    times = [(r['model'], r['total_time']) for r in ranked if not r.get('error')]
+    if times:
+        fastest = min(times, key=lambda x: x[1])
+        slowest = max(times, key=lambda x: x[1])
+        report.append(f"**Speed:** Fastest was `{fastest[0]}` ({fastest[1]:.0f}s), slowest was `{slowest[0]}` ({slowest[1]:.0f}s)")
+        report.append("")
+
+    # Category coverage
+    report.append("**Category Coverage:**")
+    for r in ranked:
+        if r.get("error"):
+            continue
+        missing = []
+        if r['market_validated'] == 0:
+            missing.append("Market")
+        if r['brand_validated'] == 0:
+            missing.append("Brand")
+        if r['competitive_validated'] == 0:
+            missing.append("Competitive")
+        if missing:
+            report.append(f"- `{r['model']}`: ❌ Missing {', '.join(missing)}")
+        else:
+            report.append(f"- `{r['model']}`: ✅ All categories covered")
+    report.append("")
+
+    # Broad query effectiveness
+    report.append("**Dual-Query Strategy Effectiveness:**")
+    for r in ranked:
+        if r.get("error"):
+            continue
+        report.append(f"- `{r['model']}`: {r['broad_queries_used']} broad queries rescued additional results")
+    report.append("")
+
+    text = "\n".join(report)
+
+    with open(output_path, "w") as f:
+        f.write(text)
+
+    print(f"\n📄 Report saved to: {output_path}")
+    print(f"\n{text}")
+    return text
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test KAIA Researcher search quality")
     parser.add_argument("--local", action="store_true", help="Test against localhost:8000")
-    parser.add_argument("--direct", action="store_true", help="Test openai_web_search directly")
+    parser.add_argument("--model", type=str, help="Test a specific model deployment name")
+    parser.add_argument("--compare", action="store_true", help="Compare all deployed models")
+    parser.add_argument("--wait", type=int, default=90, help="Seconds to wait between model tests (default: 90)")
+    parser.add_argument("--max-per-category", type=int, default=None, help="Override max hypotheses per category")
     args = parser.parse_args()
 
-    if args.direct:
-        test_direct_search()
+    base_url = API_URL_LOCAL if args.local else API_URL_PROD
+
+    if args.compare:
+        results = compare_models(base_url, MODELS, wait_between=args.wait, max_per_category=args.max_per_category)
+        report_path = os.path.join(os.path.dirname(__file__), "..", "model_comparison_report.md")
+        generate_report(results, report_path)
+    elif args.model:
+        result = test_model(base_url, model=args.model, verbose=True, max_per_category=args.max_per_category)
+        print(f"\nFinal: {json.dumps({k: v for k, v in result.items() if k not in ('details', 'validated_items', 'summary')}, indent=2)}")
     else:
-        base_url = API_URL_LOCAL if args.local else API_URL_PROD
-        test_api(base_url)
+        result = test_model(base_url, model=None, verbose=True, max_per_category=args.max_per_category)
+        print(f"\nFinal: {json.dumps({k: v for k, v in result.items() if k not in ('details', 'validated_items', 'summary')}, indent=2)}")

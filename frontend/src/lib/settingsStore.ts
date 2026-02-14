@@ -9,6 +9,9 @@
 export interface AppSettings {
     systemPrompt: string
     maxHypothesesPerCategory: number
+    hypothesisPrompt: string
+    activePromptTab: 'system' | 'hypothesis'
+    minVerifiedSourcePct: number
 }
 
 const STORAGE_KEY = 'researcher_settings_v1'
@@ -21,15 +24,51 @@ Your role:
 - Validate hypotheses with web evidence and provide cited sources.
 
 Guidelines:
-- Be specific: reference real events, campaigns, store openings/closings, market shifts.
+- Be specific: reference real events, campaigns, product launches, market shifts.
 - Be evidence-based: only report findings backed by credible web sources.
 - Be concise: use bullet points and structured output.
-- Focus on UK fashion retail unless otherwise specified.
+- Tailor your analysis to the brand's specific industry and market context.
 - Always include the time period in search queries to get relevant results.`
+
+const DEFAULT_HYPOTHESIS_PROMPT = `When generating hypotheses, follow these rules:
+
+INDUSTRY CONTEXT:
+- First determine the brand's industry (e.g. automotive, fashion, technology, FMCG).
+- ALL hypotheses must be relevant to the brand's actual industry.
+- Do NOT include trends, competitors, or events from unrelated industries.
+
+MARKET HYPOTHESES (macro trends):
+- Economic conditions: consumer spending, inflation, interest rates, currency shifts.
+- Industry-specific disruptions: regulation, technology shifts, supply chain events.
+- Consumer behaviour changes: purchasing patterns, demographics, sentiment.
+- Political, trade, or environmental factors affecting the brand's sector.
+
+BRAND HYPOTHESES (brand's own actions):
+- Each must reference a SPECIFIC action, person, product, campaign, or event.
+- Include: product launches/recalls, leadership changes, PR events, controversies.
+- Include: store/facility openings or closures, pricing changes, strategy shifts.
+- Avoid generic statements like "brand improved marketing" — name the campaign.
+
+COMPETITIVE HYPOTHESES:
+- Each must name a SPECIFIC competitor from the brand's actual industry.
+- Competitors must operate in the SAME market — never cross-industry.
+- Include specific actions: campaigns, product launches, pricing moves, expansions.
+- Each hypothesis should focus on a DIFFERENT competitor.
+
+SEARCH QUERIES:
+- search_query: specific and targeted (include brand/competitor name + time period).
+- search_query_broad: broader fallback (include brand/competitor name + time period).
+
+QUALITY CHECK:
+- Before finalising, review each hypothesis for relevance to the brand and its industry.
+- Remove anything that a domain expert would consider irrelevant or nonsensical.`
 
 export const DEFAULT_SETTINGS: AppSettings = {
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     maxHypothesesPerCategory: 4,
+    hypothesisPrompt: DEFAULT_HYPOTHESIS_PROMPT,
+    activePromptTab: 'system',
+    minVerifiedSourcePct: 25,
 }
 
 export function loadSettings(): AppSettings {
@@ -45,6 +84,14 @@ export function loadSettings(): AppSettings {
                     parsed.maxHypothesesPerCategory <= 10
                     ? parsed.maxHypothesesPerCategory
                     : DEFAULT_SETTINGS.maxHypothesesPerCategory,
+            hypothesisPrompt: typeof parsed.hypothesisPrompt === 'string' ? parsed.hypothesisPrompt : '',
+            activePromptTab: parsed.activePromptTab === 'hypothesis' ? 'hypothesis' : 'system',
+            minVerifiedSourcePct:
+                typeof parsed.minVerifiedSourcePct === 'number' &&
+                    parsed.minVerifiedSourcePct >= 0 &&
+                    parsed.minVerifiedSourcePct <= 100
+                    ? parsed.minVerifiedSourcePct
+                    : DEFAULT_SETTINGS.minVerifiedSourcePct,
         }
     } catch {
         return { ...DEFAULT_SETTINGS }
